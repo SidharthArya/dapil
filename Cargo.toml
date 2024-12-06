@@ -1,0 +1,20 @@
+[package]
+name = "dapil"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "dapil"
+crate-type = ["cdylib"]
+
+
+[features]
+experimental-async = []
+rt-multi-thread = []
+
+[dependencies]
+axum = {version = "0.7.9"}
+log = "0.4.22"
+pyo3 = {version = "0.23.1", features = ["extension-module", "experimental-async"]}
+tokio = {version = "1.42.0", features = ["full"]}

@@ -1,0 +1,5 @@
+/target
+.env
+test_project
+.idea
+.envrc
