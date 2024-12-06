@@ -21,3 +21,12 @@ app.serve()
 - [ ] Routing
 - [ ] Views
 - [ ] Database Models
+
+# Building
+As currently it is not ready for real world use cases, it will need to be built manually to be used.
+
+Run the following command to build and add dapil to your pip packages.
+```bash
+pip install maturin
+maturin develop
+```
