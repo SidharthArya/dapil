@@ -7,8 +7,10 @@ use axum::{
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use log::info;
+use tracing::{info, level_filters::LevelFilter};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use pyo3::PyObject;
+use tower_http::trace::TraceLayer;
 
 #[derive(Debug)]
 struct PyHandler(PyObject);
@@ -118,6 +120,8 @@ impl App {
              router = router.route("/", routing::get(|| async { "Dapil is running!" }));
         }
 
+        let router = router.layer(TraceLayer::new_for_http());
+
         py.allow_threads(|| {
             runtime.block_on(async {
                 let addr = format!("{}:{}", self.host, self.port);
@@ -132,9 +136,25 @@ impl App {
 
 
 
+#[pyfunction]
+fn setup_logging(level: Option<String>) {
+    let filter = match level {
+        Some(l) => EnvFilter::builder()
+            .with_default_directive(l.parse().unwrap_or(LevelFilter::INFO.into()))
+            .from_env_lossy(),
+        None => EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()),
+    };
+
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(filter)
+        .init();
+}
+
 #[pymodule]
 fn _dapil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<App>()?;
+    m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
     Ok(())
 }
 

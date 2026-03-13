@@ -1,4 +1,4 @@
-from ._dapil import App as _App
+from ._dapil import App as _App, setup_logging
 
 class App:
     def __init__(self):
