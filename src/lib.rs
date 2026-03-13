@@ -9,7 +9,9 @@ use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tracing::info;
 use pyo3::PyObject;
-use tower_http::trace::TraceLayer;
+// use tower_http::trace::TraceLayer;
+use std::thread;
+use tokio::sync::oneshot;
 
 #[derive(Debug)]
 struct PyHandler(PyObject);
@@ -80,28 +82,40 @@ impl App {
         let runtime = Runtime::new().expect("Failed to create Tokio Runtime");
         let mut router = Router::new();
 
+        // High-performance channel for the "Single Actor" GIL model
+        let (tx, rx) = flume::unbounded::<(PyHandler, oneshot::Sender<String>)>();
+
+        // Start the dedicated Python Worker thread
+        thread::spawn(move || {
+            while let Ok((handler, response_tx)) = rx.recv() {
+                Python::with_gil(|py| {
+                    let args = pyo3::types::PyTuple::empty(py);
+                    let result = match handler.0.call1(py, args) {
+                        Ok(res) => res.extract::<String>(py).unwrap_or_else(|_| "Error".to_string()),
+                        Err(e) => {
+                            e.print(py);
+                            "Internal Server Error".to_string()
+                        }
+                    };
+                    let _ = response_tx.send(result);
+                });
+            }
+        });
+
         // Clone routes to avoid holding a borrow on self during router construction
         let routes_copy: Vec<(String, String, PyHandler)> = self.routes.clone();
 
         for (path, method, handler) in routes_copy {
-            let handler_clone = handler.clone();
+            let tx_clone = tx.clone();
             
-            // Define the core handler logic once
+            // Define the dispatcher logic
             let run_handler = move || {
-                let h = handler_clone.clone();
+                let h = handler.clone();
+                let tx_inner = tx_clone.clone();
                 async move {
-                    tokio::task::spawn_blocking(move || {
-                        Python::with_gil(|py| {
-                            let args = pyo3::types::PyTuple::empty(py);
-                            match h.0.call1(py, args) {
-                                Ok(res) => res.extract::<String>(py).unwrap_or_else(|_| "Error".to_string()),
-                                Err(e) => {
-                                    e.print(py);
-                                    "Internal Server Error".to_string()
-                                }
-                            }
-                        })
-                    }).await.unwrap_or_else(|_| "Runtime Error".to_string())
+                    let (resp_tx, resp_rx) = oneshot::channel();
+                    let _ = tx_inner.send((h, resp_tx));
+                    resp_rx.await.unwrap_or_else(|_| "Runtime Error".to_string())
                 }
             };
 
@@ -117,8 +131,6 @@ impl App {
         if self.routes.is_empty() {
              router = router.route("/", routing::get(|| async { "Dapil is running!" }));
         }
-
-        // let router = router.layer(TraceLayer::new_for_http());
 
         py.allow_threads(|| {
             runtime.block_on(async {
