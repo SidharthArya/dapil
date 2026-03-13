@@ -86,34 +86,31 @@ impl App {
         for (path, method, handler) in routes_copy {
             let handler_clone = handler.clone();
             
-            // Helper to create a service for a given handler
-            let make_service = |h: PyHandler| {
-                routing::get(move || {
-                    let h_inner = h.clone();
-                    async move {
+            // Define the core handler logic once
+            let run_handler = move || {
+                let h = handler_clone.clone();
+                async move {
+                    tokio::task::spawn_blocking(move || {
                         Python::with_gil(|py| {
-                            let res = h_inner.0.call0(py).expect("Failed to call handler");
-                            res.extract::<String>(py).expect("Handler must return a string")
+                            let args = pyo3::types::PyTuple::empty(py);
+                            match h.0.call1(py, args) {
+                                Ok(res) => res.extract::<String>(py).unwrap_or_else(|_| "Error".to_string()),
+                                Err(e) => {
+                                    e.print(py);
+                                    "Internal Server Error".to_string()
+                                }
+                            }
                         })
-                    }
-                })
+                    }).await.unwrap_or_else(|_| "Runtime Error".to_string())
+                }
             };
 
             router = match method.as_str() {
-                "GET" => router.route(&path, make_service(handler_clone)),
-                "POST" => {
-                    let h_inner = handler_clone.clone();
-                    router.route(&path, routing::post(move || {
-                        let h_final = h_inner.clone();
-                        async move {
-                            Python::with_gil(|py| {
-                                let res = h_final.0.call0(py).expect("Failed to call handler");
-                                res.extract::<String>(py).expect("Handler must return a string")
-                            })
-                        }
-                    }))
-                },
-                _ => router.route(&path, make_service(handler_clone)),
+                "GET" => router.route(&path, routing::get(run_handler)),
+                "POST" => router.route(&path, routing::post(run_handler)),
+                "PUT" => router.route(&path, routing::put(run_handler)),
+                "DELETE" => router.route(&path, routing::delete(run_handler)),
+                _ => router.route(&path, routing::get(run_handler)),
             };
         }
 
@@ -121,7 +118,7 @@ impl App {
              router = router.route("/", routing::get(|| async { "Dapil is running!" }));
         }
 
-        let router = router.layer(TraceLayer::new_for_http());
+        // let router = router.layer(TraceLayer::new_for_http());
 
         py.allow_threads(|| {
             runtime.block_on(async {
