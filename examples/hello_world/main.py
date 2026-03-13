@@ -1,5 +1,7 @@
 import dapil
 
+dapil.setup_logging("DEBUG")
+
 app = dapil.App()
 app.set_host("127.0.0.1")
 app.set_port(8181)
