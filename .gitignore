@@ -3,3 +3,6 @@
 test_project
 .idea
 .envrc
+**/__pycache__
+**/*.so
+**/test.py
