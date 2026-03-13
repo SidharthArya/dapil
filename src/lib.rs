@@ -7,8 +7,7 @@ use axum::{
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tracing::{info, level_filters::LevelFilter};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing::info;
 use pyo3::PyObject;
 use tower_http::trace::TraceLayer;
 
@@ -36,6 +35,8 @@ struct App {
 impl App {
     #[new]
     fn new() -> Self {
+        // Automatically initialize logging bridge if not already done
+        let _ = pyo3_log::try_init();
         App {
             host: "0.0.0.0".to_string(),
             port: 8080,
@@ -145,18 +146,8 @@ impl App {
 
 
 #[pyfunction]
-fn setup_logging(level: Option<String>) {
-    let filter = match level {
-        Some(l) => EnvFilter::builder()
-            .with_default_directive(l.parse().unwrap_or(LevelFilter::INFO.into()))
-            .from_env_lossy(),
-        None => EnvFilter::from_default_env().add_directive(LevelFilter::INFO.into()),
-    };
-
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+fn setup_logging() {
+    let _ = pyo3_log::try_init();
 }
 
 #[pymodule]

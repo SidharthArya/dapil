@@ -1,6 +1,8 @@
 import dapil
+import logging
 
-dapil.setup_logging("DEBUG")
+logging.basicConfig(level=logging.DEBUG, format='%(levelname)s:%(name)s:%(message)s')
+# dapil.setup_logging() is no longer needed
 
 app = dapil.App()
 app.set_host("127.0.0.1")
