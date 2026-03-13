@@ -1,23 +1,23 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
     <url>
-         <loc>https://dapil.example.com/</loc>
+         <loc>https://docs.sidhartharya.com/dapil/</loc>
          <lastmod>2026-03-13</lastmod>
     </url>
     <url>
-         <loc>https://dapil.example.com/architecture/</loc>
+         <loc>https://docs.sidhartharya.com/dapil/architecture/</loc>
          <lastmod>2026-03-13</lastmod>
     </url>
     <url>
-         <loc>https://dapil.example.com/benchmarks/</loc>
+         <loc>https://docs.sidhartharya.com/dapil/benchmarks/</loc>
          <lastmod>2026-03-13</lastmod>
     </url>
     <url>
-         <loc>https://dapil.example.com/features/</loc>
+         <loc>https://docs.sidhartharya.com/dapil/features/</loc>
          <lastmod>2026-03-13</lastmod>
     </url>
     <url>
-         <loc>https://dapil.example.com/logging/</loc>
+         <loc>https://docs.sidhartharya.com/dapil/logging/</loc>
          <lastmod>2026-03-13</lastmod>
     </url>
 </urlset>
