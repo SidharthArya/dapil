@@ -126,8 +126,16 @@ impl App {
             runtime.block_on(async {
                 let addr = format!("{}:{}", self.host, self.port);
                 let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
-                info!("Dapil serving on {}", addr);
-                axum::serve(listener, router).await.unwrap();
+                info!("Dapil serving on http://{}", addr);
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        tokio::signal::ctrl_c()
+                            .await
+                            .expect("failed to install CTRL+C handler");
+                        info!("Shutdown signal received, stopping server...");
+                    })
+                    .await
+                    .unwrap();
             });
         });
     }
