@@ -5,8 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
-name = "dapil"
+name = "_dapil"
 crate-type = ["cdylib"]
+
+[package.metadata.maturin]
+python-source = "python"
+module-name = "dapil._dapil"
 
 
 [features]

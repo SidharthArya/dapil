@@ -1,54 +1,131 @@
 mod methods;
 
-use std::collections::HashMap;
 use pyo3::prelude::*;
 use axum::{
     routing,
     Router,
 };
-use std::net::SocketAddr;
-use std::string::ToString;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio;
-use pyo3::types::PyFunction;
-use log::{info, warn};
+use log::info;
+use pyo3::PyObject;
+
+#[derive(Debug)]
+struct PyHandler(PyObject);
+
+impl Clone for PyHandler {
+    fn clone(&self) -> Self {
+        Python::with_gil(|py| PyHandler(self.0.clone_ref(py)))
+    }
+}
+
+unsafe impl Send for PyHandler {}
+unsafe impl Sync for PyHandler {}
 
 #[pyclass]
 struct App {
     host: String,
     port: u16,
-    routes: HashMap<String, HashMap<String, extern fn(args: String)>>,
+    // Store routes as (path, method) -> handler
+    routes: Vec<(String, String, PyHandler)>,
 }
 
 #[pymethods]
 impl App {
     #[new]
     fn new() -> Self {
-        return App {host: "0.0.0.0".to_string(), port: 8080, routes: HashMap::new()};
+        App {
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+            routes: Vec::new(),
+        }
     }
 
-    fn set_host(&mut self, host: &str){
+    fn set_host(&mut self, host: &str) {
         self.host = String::from(host);
     }
 
-    fn set_port(&mut self, port: u16){
+    fn set_port(&mut self, port: u16) {
         self.port = port;
     }
 
-    // fn add_routes(&mut self, router: Router) -> Router{
-    // }
+    fn route(&mut self, method: String, path: String, handler: PyObject) {
+        self.routes.push((path, method.to_uppercase(), PyHandler(handler)));
+    }
 
+    fn get(&mut self, path: String, handler: PyObject) {
+        self.route("GET".to_string(), path, handler);
+    }
 
-    fn serve(&mut self) {
+    fn post(&mut self, path: String, handler: PyObject) {
+        self.route("POST".to_string(), path, handler);
+    }
+
+    fn put(&mut self, path: String, handler: PyObject) {
+        self.route("PUT".to_string(), path, handler);
+    }
+
+    fn delete(&mut self, path: String, handler: PyObject) {
+        self.route("DELETE".to_string(), path, handler);
+    }
+
+    fn serve_default(&mut self, py: Python<'_>) {
+        self.serve(py);
+    }
+
+    fn serve(&mut self, py: Python<'_>) {
         let runtime = Runtime::new().expect("Failed to create Tokio Runtime");
-        let mut app = Router::new();
-        app = app.route("/", routing::get(|| async {"Hello World"}));
-        runtime.block_on(async {
-            let listener = tokio::net::TcpListener::bind((self.host).to_owned() + &*":".to_owned() + &*self.port.to_string()).await.unwrap();
-            axum::serve(listener, app).await.unwrap();
-        });
+        let mut router = Router::new();
 
+        // Clone routes to avoid holding a borrow on self during router construction
+        let routes_copy: Vec<(String, String, PyHandler)> = self.routes.clone();
+
+        for (path, method, handler) in routes_copy {
+            let handler_clone = handler.clone();
+            
+            // Helper to create a service for a given handler
+            let make_service = |h: PyHandler| {
+                routing::get(move || {
+                    let h_inner = h.clone();
+                    async move {
+                        Python::with_gil(|py| {
+                            let res = h_inner.0.call0(py).expect("Failed to call handler");
+                            res.extract::<String>(py).expect("Handler must return a string")
+                        })
+                    }
+                })
+            };
+
+            router = match method.as_str() {
+                "GET" => router.route(&path, make_service(handler_clone)),
+                "POST" => {
+                    let h_inner = handler_clone.clone();
+                    router.route(&path, routing::post(move || {
+                        let h_final = h_inner.clone();
+                        async move {
+                            Python::with_gil(|py| {
+                                let res = h_final.0.call0(py).expect("Failed to call handler");
+                                res.extract::<String>(py).expect("Handler must return a string")
+                            })
+                        }
+                    }))
+                },
+                _ => router.route(&path, make_service(handler_clone)),
+            };
+        }
+
+        if self.routes.is_empty() {
+             router = router.route("/", routing::get(|| async { "Dapil is running!" }));
+        }
+
+        py.allow_threads(|| {
+            runtime.block_on(async {
+                let addr = format!("{}:{}", self.host, self.port);
+                let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
+                info!("Dapil serving on {}", addr);
+                axum::serve(listener, router).await.unwrap();
+            });
+        });
     }
 }
 
@@ -56,7 +133,7 @@ impl App {
 
 
 #[pymodule]
-fn dapil(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _dapil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<App>()?;
     Ok(())
 }
