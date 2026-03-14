@@ -1,6 +1,7 @@
 from ._dapil import App as _App, setup_logging
 from .exceptions import HTTPException
 from .responses import Response, StreamingResponse
+from .routing import APIRouter
 
 class App:
     def __init__(self):
@@ -23,6 +24,14 @@ class App:
 
     def delete(self, path: str):
         return self.route("DELETE", path)
+
+    def include_router(self, router: APIRouter, prefix: str = ""):
+        for method, path, handler in router.routes:
+            full_path = prefix + path
+            # Ensure path starts with /
+            if not full_path.startswith("/"):
+                full_path = "/" + full_path
+            self._app.route(method, full_path, handler)
 
     def serve(self, workers: int = 1):
         self._app.set_workers(workers)
