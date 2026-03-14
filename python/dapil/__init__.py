@@ -24,7 +24,8 @@ class App:
     def delete(self, path: str):
         return self.route("DELETE", path)
 
-    def serve(self):
+    def serve(self, workers: int = 1):
+        self._app.set_workers(workers)
         self._app.serve()
 
     def serve_default(self):
