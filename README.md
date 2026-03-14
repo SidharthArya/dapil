@@ -59,9 +59,22 @@ This architecture ensures the Python interpreter spends zero time fighting for l
 
 ## 📖 Documentation
 
-- [Architecture Overview](docs/architecture.md)
-- [Benchmarking Guide](docs/benchmarks.md)
-- [Logging & Observability](docs/logging.md)
+The documentation is built with [MkDocs](https://www.mkdocs.org/) using the Material theme for a premium, FastAPI-style experience.
+
+- [Live Documentation Structure](docs/index.md)
+- [Architecture Deep-Dive](docs/architecture.md)
+- [Benchmarking Results](docs/benchmarks.md)
+
+### Running the Documentation Locally
+
+To preview the documentation site locally:
+
+```bash
+pip install mkdocs-material
+mkdocs serve
+```
+
+Then visit `http://127.0.0.1:8000` in your browser.
 
 ## License
 MIT

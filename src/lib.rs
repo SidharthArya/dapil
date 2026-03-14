@@ -11,7 +11,46 @@ use tracing::info;
 use pyo3::PyObject;
 // use tower_http::trace::TraceLayer;
 use std::thread;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, mpsc};
+use axum::{
+    response::{IntoResponse, Response},
+    http::{StatusCode, HeaderMap, HeaderName, HeaderValue},
+    body::Body,
+};
+use futures_util::stream::StreamExt;
+
+enum BodyData {
+    Bytes(Vec<u8>),
+    Stream(mpsc::Receiver<Vec<u8>>),
+}
+
+struct ResponseData {
+    status: u16,
+    body: BodyData,
+    headers: Vec<(String, String)>,
+}
+
+impl IntoResponse for ResponseData {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let mut headers = HeaderMap::new();
+        for (k, v) in self.headers {
+            if let (Ok(name), Ok(value)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(&v)) {
+                headers.insert(name, value);
+            }
+        }
+
+        match self.body {
+            BodyData::Bytes(bytes) => (status, headers, bytes).into_response(),
+            BodyData::Stream(rx) => {
+                let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+                    .map(|chunk| Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(chunk)));
+                let body = Body::from_stream(stream);
+                (status, headers, body).into_response()
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct PyHandler(PyObject);
@@ -83,21 +122,124 @@ impl App {
         let mut router = Router::new();
 
         // High-performance channel for the "Single Actor" GIL model
-        let (tx, rx) = flume::unbounded::<(PyHandler, oneshot::Sender<String>)>();
+        let (tx, rx) = flume::unbounded::<(PyHandler, oneshot::Sender<ResponseData>)>();
 
         // Start the dedicated Python Worker thread
         thread::spawn(move || {
             while let Ok((handler, response_tx)) = rx.recv() {
                 Python::with_gil(|py| {
                     let args = pyo3::types::PyTuple::empty(py);
-                    let result = match handler.0.call1(py, args) {
-                        Ok(res) => res.extract::<String>(py).unwrap_or_else(|_| "Error".to_string()),
+                    let result_obj = match handler.0.bind(py).call1(args) {
+                        Ok(res) => res,
                         Err(e) => {
+                            // Check if it's an HTTPException
+                            if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
+                                // Try to extract status_code and detail
+                                let val = e.value(py);
+                                let status_code = val.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(500);
+                                let detail = val.getattr("detail").and_then(|d| d.extract::<String>()).unwrap_or_else(|_| "Internal Server Error".to_string());
+                                let _ = response_tx.send(ResponseData {
+                                    status: status_code,
+                                    body: BodyData::Bytes(detail.into_bytes()),
+                                    headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                                });
+                                return;
+                            }
                             e.print(py);
-                            "Internal Server Error".to_string()
+                            let _ = response_tx.send(ResponseData {
+                                status: 500,
+                                body: BodyData::Bytes("Internal Server Error".as_bytes().to_vec()),
+                                headers: vec![],
+                            });
+                            return;
                         }
                     };
-                    let _ = response_tx.send(result);
+
+                    // Handle different return types
+                    let response_data = if let Ok(s) = result_obj.extract::<String>() {
+                        ResponseData {
+                            status: 200,
+                            body: BodyData::Bytes(s.into_bytes()),
+                            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                        }
+                    } else if let Ok(b) = result_obj.extract::<Vec<u8>>() {
+                         ResponseData {
+                            status: 200,
+                            body: BodyData::Bytes(b),
+                            headers: vec![("content-type".to_string(), "application/octet-stream".to_string())],
+                        }
+                    } else {
+                        // Check if it's a Response or StreamingResponse object
+                        let status = result_obj.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(200);
+                        let headers_dict = result_obj.getattr("headers").and_then(|h| h.extract::<std::collections::HashMap<String, String>>()).unwrap_or_default();
+                        let mut headers = Vec::new();
+                        for (k, v) in headers_dict {
+                            headers.push((k, v));
+                        }
+
+                        // Determine if it's a stream
+                        let body = if result_obj.getattr("content").is_ok() {
+                            let content = result_obj.getattr("content").unwrap();
+                            
+                            // Check for StreamingResponse marker
+                            let is_streaming = !content.is_instance_of::<pyo3::types::PyString>() && 
+                                               !content.is_instance_of::<pyo3::types::PyBytes>() && 
+                                               content.iter().is_ok();
+
+                            if is_streaming {
+                                let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(10);
+                                
+                                let _ = response_tx.send(ResponseData {
+                                    status,
+                                    body: BodyData::Stream(chunk_rx),
+                                    headers,
+                                });
+
+                                // Now iterate and send chunks
+                                if let Ok(it) = content.iter() {
+                                    for chunk_res in it {
+                                        match chunk_res {
+                                            Ok(chunk_obj) => {
+                                                let chunk = if let Ok(s) = chunk_obj.extract::<String>() {
+                                                    s.into_bytes()
+                                                } else if let Ok(b) = chunk_obj.extract::<Vec<u8>>() {
+                                                    b
+                                                } else {
+                                                    vec![]
+                                                };
+                                                if let Err(_) = chunk_tx.blocking_send(chunk) {
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                e.print(py);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                return;
+                            } else {
+                                // Default bytes/string body
+                                if let Ok(s) = content.extract::<String>() {
+                                    BodyData::Bytes(s.into_bytes())
+                                } else if let Ok(b) = content.extract::<Vec<u8>>() {
+                                    BodyData::Bytes(b)
+                                } else {
+                                    BodyData::Bytes(vec![])
+                                }
+                            }
+                        } else {
+                            BodyData::Bytes(vec![])
+                        };
+
+                        ResponseData {
+                            status,
+                            body,
+                            headers,
+                        }
+                    };
+                    let _ = response_tx.send(response_data);
                 });
             }
         });
@@ -115,7 +257,11 @@ impl App {
                 async move {
                     let (resp_tx, resp_rx) = oneshot::channel();
                     let _ = tx_inner.send((h, resp_tx));
-                    resp_rx.await.unwrap_or_else(|_| "Runtime Error".to_string())
+                    resp_rx.await.unwrap_or(ResponseData {
+                        status: 500,
+                        body: BodyData::Bytes("Runtime Error".as_bytes().to_vec()),
+                        headers: vec![],
+                    })
                 }
             };
 
