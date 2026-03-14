@@ -17,7 +17,7 @@ use axum::{
     http::{StatusCode, HeaderMap, HeaderName, HeaderValue},
     body::Body,
 };
-use futures_util::stream::StreamExt;
+use tokio_stream::StreamExt;
 
 enum BodyData {
     Bytes(Vec<u8>),
@@ -119,26 +119,26 @@ impl App {
         self.route("DELETE".to_string(), path, handler);
     }
 
-    fn serve_default(&mut self, py: Python<'_>) {
-        self.serve(py);
+    fn serve_default(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.serve(py)
     }
 
-    fn serve(&mut self, py: Python<'_>) {
+    fn serve(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.workers > 1 {
-            self.serve_multi(py);
+            self.serve_multi(py)
         } else {
-            self.serve_single(py);
+            self.serve_single(py)
         }
     }
 }
 
 impl App {
-    fn serve_single(&mut self, py: Python<'_>) {
+    fn serve_single(&mut self, py: Python<'_>) -> PyResult<()> {
         let runtime = Runtime::new().expect("Failed to create Tokio Runtime");
-        self.setup_and_run(py, runtime);
+        self.setup_and_run(py, runtime)
     }
 
-    fn serve_multi(&mut self, _py: Python<'_>) {
+    fn serve_multi(&mut self, _py: Python<'_>) -> PyResult<()> {
         use nix::unistd::{fork, ForkResult};
         use nix::sys::wait::wait;
 
@@ -152,7 +152,7 @@ impl App {
                 Ok(ForkResult::Child) => {
                     // Child process: initialize its own runtime and serve
                     let runtime = Runtime::new().expect("Failed to create Tokio Runtime");
-                    self.serve_worker(runtime);
+                    let _ = self.serve_worker(runtime);
                     std::process::exit(0);
                 }
                 Err(_) => panic!("Fork failed"),
@@ -163,25 +163,36 @@ impl App {
         for _ in 0..self.workers {
             let _ = wait();
         }
+        Ok(())
     }
 
-    fn serve_worker(&mut self, runtime: Runtime) {
+    fn serve_worker(&mut self, runtime: Runtime) -> PyResult<()> {
         Python::with_gil(|py| {
-            self.setup_and_run(py, runtime);
-        });
+            self.setup_and_run(py, runtime)
+        })
     }
 
-    fn setup_and_run(&mut self, py: Python<'_>, runtime: Runtime) {
+    fn setup_and_run(&mut self, py: Python<'_>, runtime: Runtime) -> PyResult<()> {
         let mut router = Router::new();
         // High-performance channel for the "Single Actor" GIL model
-        let (tx, rx) = flume::unbounded::<(PyHandler, oneshot::Sender<ResponseData>)>();
+        let (tx, rx) = flume::unbounded::<(PyHandler, std::collections::HashMap<String, String>, oneshot::Sender<ResponseData>)>();
 
         // Start the dedicated Python Worker thread
-        thread::spawn(move || {
-            while let Ok((handler, response_tx)) = rx.recv() {
+        let worker_handle = thread::spawn(move || {
+            while let Ok((handler, params, response_tx)) = rx.recv() {
                 Python::with_gil(|py| {
                     let args = pyo3::types::PyTuple::empty(py);
-                    let result_obj = match handler.0.bind(py).call1(args) {
+                    let kwargs = pyo3::types::PyDict::new(py);
+                    for (k, v) in params {
+                        // Attempt to convert to int if possible, common FastAPI behavior
+                        if let Ok(i) = v.parse::<i64>() {
+                            let _ = kwargs.set_item(k, i);
+                        } else {
+                            let _ = kwargs.set_item(k, v);
+                        }
+                    }
+
+                    let result_obj = match handler.0.bind(py).call(args, Some(&kwargs)) {
                         Ok(res) => res,
                         Err(e) => {
                             // Check if it's an HTTPException
@@ -309,14 +320,16 @@ impl App {
 
         for (path, method, handler) in routes_copy {
             let tx_clone = tx.clone();
+            let axum_path = path.replace('{', ":").replace('}', "");
             
             // Define the dispatcher logic
-            let run_handler = move || {
+            let run_handler = move |params: Option<axum::extract::Path<std::collections::HashMap<String, String>>>| {
+                let params = params.map(|axum::extract::Path(p)| p).unwrap_or_default();
                 let h = handler.clone();
                 let tx_inner = tx_clone.clone();
                 async move {
                     let (resp_tx, resp_rx) = oneshot::channel();
-                    let _ = tx_inner.send((h, resp_tx));
+                    let _ = tx_inner.send((h, params, resp_tx));
                     resp_rx.await.unwrap_or(ResponseData {
                         status: 500,
                         body: BodyData::Bytes("Runtime Error".as_bytes().to_vec()),
@@ -326,17 +339,19 @@ impl App {
             };
 
             router = match method.as_str() {
-                "GET" => router.route(&path, routing::get(run_handler)),
-                "POST" => router.route(&path, routing::post(run_handler)),
-                "PUT" => router.route(&path, routing::put(run_handler)),
-                "DELETE" => router.route(&path, routing::delete(run_handler)),
-                _ => router.route(&path, routing::get(run_handler)),
+                "GET" => router.route(&axum_path, routing::get(run_handler)),
+                "POST" => router.route(&axum_path, routing::post(run_handler)),
+                "PUT" => router.route(&axum_path, routing::put(run_handler)),
+                "DELETE" => router.route(&axum_path, routing::delete(run_handler)),
+                _ => router.route(&axum_path, routing::get(run_handler)),
             };
         }
 
         if self.routes.is_empty() {
              router = router.route("/", routing::get(|| async { "Dapil is running!" }));
         }
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         py.allow_threads(|| {
             runtime.block_on(async {
@@ -352,6 +367,7 @@ impl App {
                 socket.set_reuse_address(true).expect("Failed to set reuse address");
                 #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
                 socket.set_reuse_port(true).expect("Failed to set reuse port");
+                socket.set_nonblocking(true).expect("Failed to set nonblocking");
 
                 let address: std::net::SocketAddr = addr.parse().expect("Failed to parse address");
                 socket.bind(&address.into()).expect("Failed to bind socket");
@@ -360,17 +376,66 @@ impl App {
                 let listener = TcpListener::from_std(socket.into()).expect("Failed to convert socket");
 
                 info!("Dapil serving on http://{}", addr);
-                axum::serve(listener, router)
-                    .with_graceful_shutdown(async {
-                        tokio::signal::ctrl_c()
+
+                // We must ensure the router (and its clones of tx) are dropped before we join the worker thread
+                {
+                    let server_task = async move {
+                        axum::serve(listener, router)
+                            .with_graceful_shutdown(async move {
+                                let _ = shutdown_rx.await;
+                            })
                             .await
-                            .expect("failed to install CTRL+C handler");
-                        info!("Shutdown signal received, stopping server...");
-                    })
-    .await
-                    .unwrap();
+                    };
+
+                    tokio::pin!(server_task);
+
+                    loop {
+                        tokio::select! {
+                            res = &mut server_task => {
+                                if let Err(e) = res {
+                                    println!("Axum server error: {}", e);
+                                }
+                                break;
+                            }
+                            _ = tokio::signal::ctrl_c() => {
+                                println!("Shutdown signal received, starting graceful shutdown...");
+                                let _ = shutdown_tx.send(());
+                                
+                                // Wait for server to stop with timeout or second Ctrl+C
+                                tokio::select! {
+                                    res = &mut server_task => {
+                                        if let Err(e) = res {
+                                            println!("Axum server error during shutdown: {}", e);
+                                        }
+                                        println!("Server stopped gracefully");
+                                    }
+                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                                        println!("Shutdown timeout exceeded, force stopping network...");
+                                    }
+                                    _ = tokio::signal::ctrl_c() => {
+                                        println!("Second Ctrl+C detected, force stopping process...");
+                                        std::process::exit(130);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } // server_task goes out of scope here, dropping everything
+
+                println!("Axum server fully dropped");
+                drop(tx);
+                
+                println!("Joining Python worker thread...");
             });
+            let _ = worker_handle.join();
+            println!("Python worker thread joined");
         });
+
+        // After releasing the GIL, check if a signal (like Ctrl+C) occurred
+        py.check_signals()?;
+
+        Ok(())
     }
 }
 
