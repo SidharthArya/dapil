@@ -6,3 +6,5 @@ test_project
 **/__pycache__
 **/*.so
 **/test.py
+/site
+/benchmarks/rust_bench/target
