@@ -15,10 +15,11 @@ use tokio::sync::{oneshot, mpsc};
 use axum::{
     response::{IntoResponse, Response},
     http::{StatusCode, HeaderMap, HeaderName, HeaderValue},
+    extract::{Request, Path},
     body::Body,
-    extract::Request,
 };
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
+use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 enum BodyData {
@@ -59,15 +60,10 @@ struct PyCallNext {
     tx: mpsc::Sender<(Py<PyAny>, oneshot::Sender<ResponseData>)>,
 }
 
-struct PyMiddleware(Py<PyAny>);
+#[derive(Clone)]
+struct PyMiddleware(Arc<Py<PyAny>>);
 unsafe impl Send for PyMiddleware {}
 unsafe impl Sync for PyMiddleware {}
-
-impl Clone for PyMiddleware {
-    fn clone(&self) -> Self {
-        Python::with_gil(|py| PyMiddleware(self.0.clone_ref(py)))
-    }
-}
 
 #[pymethods]
 impl PyCallNext {
@@ -102,12 +98,15 @@ impl PyCallNext {
     }
 }
 
-#[derive(Debug)]
-struct PyHandler(Py<PyAny>);
+#[derive(Debug, Clone)]
+struct PyHandler(Arc<Py<PyAny>>);
+unsafe impl Send for PyHandler {}
+unsafe impl Sync for PyHandler {}
 
 enum Task {
     Handler {
         handler: PyHandler,
+        request: Py<PyAny>,
         params: std::collections::HashMap<String, String>,
         resp_tx: oneshot::Sender<ResponseData>,
     },
@@ -119,14 +118,7 @@ enum Task {
     },
 }
 
-impl Clone for PyHandler {
-    fn clone(&self) -> Self {
-        Python::with_gil(|py| PyHandler(self.0.clone_ref(py)))
-    }
-}
-
-unsafe impl Send for PyHandler {}
-unsafe impl Sync for PyHandler {}
+// Custom Clone removed as Arc provides it
 
 #[pyclass]
 struct App {
@@ -154,7 +146,7 @@ impl App {
     }
 
     fn add_middleware_instance(&mut self, instance: Py<PyAny>) {
-        self.middlewares.push(PyMiddleware(instance));
+        self.middlewares.push(PyMiddleware(Arc::new(instance)));
     }
 
     fn set_host(&mut self, host: &str) {
@@ -170,7 +162,7 @@ impl App {
     }
 
     fn route(&mut self, method: String, path: String, handler: PyObject) {
-        self.routes.push((path, method.to_uppercase(), PyHandler(handler)));
+        self.routes.push((path, method.to_uppercase(), PyHandler(Arc::new(handler))));
     }
 
     fn get(&mut self, path: String, handler: PyObject) {
@@ -248,18 +240,14 @@ impl App {
         let (tx, rx) = flume::unbounded::<Task>();
 
         // Start the dedicated Python Worker thread
-        let handle = runtime.handle().clone();
         let worker_handle = thread::spawn(move || {
-            Python::with_gil(|py| {
-                let asyncio = py.import("asyncio").expect("failed to import asyncio");
-                let loop_obj = asyncio.call_method0("new_event_loop").expect("failed to create loop");
-                asyncio.call_method1("set_event_loop", (loop_obj,)).expect("failed to set loop");
-            });
             while let Ok(task) = rx.recv() {
-                Python::with_gil(|py| {
+                let _ = Python::with_gil(|py| -> PyResult<()> {
                     match task {
-                        Task::Handler { handler, params, resp_tx } => {
-                            let args = pyo3::types::PyTuple::empty(py);
+                        Task::Handler { handler, request, params, resp_tx } => {
+                            let mut args_vec = Vec::new();
+                            args_vec.push(request);
+                            let args = pyo3::types::PyTuple::new(py, args_vec)?;
                             let kwargs = pyo3::types::PyDict::new(py);
                             for (k, v) in params {
                                 if let Ok(i) = v.parse::<i64>() {
@@ -269,7 +257,7 @@ impl App {
                                 }
                             }
 
-                            let result_obj = match handler.0.bind(py).call(args, Some(&kwargs)) {
+                            let mut result_obj = match handler.0.bind(py).call(args, Some(&kwargs)) {
                                 Ok(res) => res,
                                 Err(e) => {
                                     if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
@@ -281,7 +269,7 @@ impl App {
                                             body: BodyData::Bytes(detail.into_bytes()),
                                             headers: vec![("content-type".to_string(), "text/plain".to_string())],
                                         });
-                                        return;
+                                        return Ok(());
                                     }
                                     e.print(py);
                                     let _ = resp_tx.send(ResponseData {
@@ -289,9 +277,26 @@ impl App {
                                         body: BodyData::Bytes("Internal Server Error".into()),
                                         headers: vec![],
                                     });
-                                    return;
+                                    return Ok(());
                                 }
                             };
+
+                            // Check if result is a coroutine
+                            let is_coroutine = py.import("inspect")?.call_method1("iscoroutine", (result_obj.clone(),))?.extract::<bool>().unwrap_or(false);
+
+                            if is_coroutine {
+                                let asyncio = py.import("asyncio")?;
+                                match asyncio.call_method1("run", (result_obj,)) {
+                                    Ok(py_res) => {
+                                        result_obj = py_res;
+                                    }
+                                    Err(e) => {
+                                        e.print(py);
+                                        let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Async Handler Error".into()), headers: vec![] });
+                                        return Ok(());
+                                    }
+                                }
+                            }
 
                             // Handle different return types
                             if let Ok(s) = result_obj.extract::<String>() {
@@ -300,7 +305,7 @@ impl App {
                                     body: BodyData::Bytes(s.into_bytes()),
                                     headers: vec![("content-type".to_string(), "text/plain".to_string())],
                                 });
-                                return;
+                                return Ok(());
                             } 
                             
                             if let Ok(b) = result_obj.extract::<Vec<u8>>() {
@@ -309,19 +314,17 @@ impl App {
                                     body: BodyData::Bytes(b),
                                     headers: vec![("content-type".to_string(), "application/octet-stream".to_string())],
                                 });
-                                return;
+                                return Ok(());
                             }
 
                             // Check if it's a Response or StreamingResponse object
-                            let status = result_obj.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(200);
-                            let headers_dict = result_obj.getattr("headers").and_then(|h| h.extract::<std::collections::HashMap<String, String>>()).unwrap_or_default();
-                            let mut headers = Vec::new();
-                            for (k, v) in headers_dict {
-                                headers.push((k, v));
-                            }
-
-                            // Determine if it's a stream
                             if let Ok(content) = result_obj.getattr("content") {
+                                let status = result_obj.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(200);
+                                let headers_dict = result_obj.getattr("headers").and_then(|h| h.extract::<std::collections::HashMap<String, String>>()).unwrap_or_default();
+                                let mut headers = Vec::new();
+                                for (k, v) in headers_dict {
+                                    headers.push((k, v));
+                                }
                                 // Check for StreamingResponse marker
                                 let is_streaming = !content.is_instance_of::<pyo3::types::PyString>() && 
                                                    !content.is_instance_of::<pyo3::types::PyBytes>() && 
@@ -383,42 +386,38 @@ impl App {
                              let inst = instance.bind(py);
                              match inst.call_method1("dispatch", (request, call_next)) {
                                 Ok(coro) => {
-                                    match pyo3_async_runtimes::tokio::into_future(coro) {
-                                        Ok(fut) => {
-                                            match handle.block_on(fut) {
-                                                Ok(py_resp_any) => {
-                                                    let py_resp_bound = py_resp_any.bind(py);
-                                                    let status = if let Ok(s) = py_resp_bound.getattr("status_code") {
-                                                        s.extract::<u16>().unwrap_or(200)
-                                                    } else {
-                                                        200
-                                                    };
-                                                    let content = if let Ok(c) = py_resp_bound.getattr("content") {
-                                                        c.extract::<Vec<u8>>().unwrap_or_default()
-                                                    } else {
-                                                        vec![]
-                                                    };
-                                                    let _ = resp_tx.send(ResponseData { status, body: BodyData::Bytes(content), headers: vec![] });
-                                                }
-                                                Err(e) => {
-                                                    e.print(py);
-                                                    let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Mid Error".into()), headers: vec![] });
-                                                }
+                                    let asyncio = py.import("asyncio")?;
+                                    match asyncio.call_method1("run", (coro,)) {
+                                        Ok(py_resp_bound) => {
+                                            let status = py_resp_bound.getattr("status_code")
+                                                .and_then(|s: Bound<'_, PyAny>| s.extract::<u16>())
+                                                .unwrap_or(200);
+                                            let content = py_resp_bound.getattr("content")
+                                                .and_then(|c: Bound<'_, PyAny>| c.extract::<Vec<u8>>())
+                                                .unwrap_or_default();
+                                            let headers_dict = py_resp_bound.getattr("headers")
+                                                .and_then(|h: Bound<'_, PyAny>| h.extract::<std::collections::HashMap<String, String>>())
+                                                .unwrap_or_default();
+                                            let mut headers = Vec::new();
+                                            for (k, v) in headers_dict {
+                                                headers.push((k, v));
                                             }
+                                            let _ = resp_tx.send(ResponseData { status, body: BodyData::Bytes(content), headers });
                                         }
                                         Err(e) => {
                                             e.print(py);
-                                            let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Mid future error".into()), headers: vec![] });
+                                            let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Middleware error".into()), headers: vec![] });
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     e.print(py);
-                                    let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Mid transition error".into()), headers: vec![] });
+                                    let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Middleware dispatch error".into()), headers: vec![] });
                                 }
                              }
                         }
                     }
+                    Ok(())
                 });
             }
         });
@@ -430,14 +429,38 @@ impl App {
             let tx_clone = tx.clone();
             let axum_path = path.replace('{', ":").replace('}', "");
             
-            let run_handler = move |params: Option<axum::extract::Path<std::collections::HashMap<String, String>>>| {
-                let params = params.map(|axum::extract::Path(p)| p).unwrap_or_default();
+            let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: Request| {
+                let params = params.0;
                 let h = handler.clone();
                 let tx_inner = tx_clone.clone();
                 async move {
                     let (resp_tx, resp_rx) = oneshot::channel();
+                    
+                    let (parts, body) = axum_req.into_parts();
+                    let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024).await.unwrap_or_default();
+
+                    let py_req = Python::with_gil(|py| {
+                        let dapil = py.import("dapil").expect("failed to import dapil");
+                        let req_cls = dapil.getattr("Request").expect("failed to get Request class");
+                        let scope = PyDict::new(py);
+                        
+                        let _ = scope.set_item("method", parts.method.as_str());
+                        let _ = scope.set_item("path", parts.uri.path());
+                        let _ = scope.set_item("query_string", parts.uri.query().unwrap_or("").as_bytes());
+                        
+                        let headers = PyList::empty(py);
+                        for (name, value) in parts.headers.iter() {
+                            let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
+                        }
+                        let _ = scope.set_item("headers", headers);
+                        let _ = scope.set_item("_body", body_bytes.as_ref());
+
+                        req_cls.call1((scope,)).expect("failed to create Request").unbind()
+                    });
+
                     let _ = tx_inner.send(Task::Handler {
                         handler: h,
+                        request: py_req,
                         params,
                         resp_tx,
                     });
@@ -469,13 +492,30 @@ impl App {
                     let (call_tx, mut call_rx) = mpsc::channel::<(Py<PyAny>, oneshot::Sender<ResponseData>)>(1);
                     let (resp_tx, mut resp_rx) = oneshot::channel::<ResponseData>();
                     
+                    let (parts, body) = req.into_parts();
+                    let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024).await.unwrap_or_default();
+                    let body_clone = body_bytes.clone();
+                    let parts_clone = parts.clone();
+
                     // Bridge to Python
                     Python::with_gil(|py| {
                         let call_next = PyCallNext { tx: call_tx };
                         // Convert Axum Request to Python-friendly Request (simplified for now)
                         let dapil = py.import("dapil").expect("failed to import dapil");
                         let req_cls = dapil.getattr("Request").expect("failed to get Request class");
-                        let scope = PyDict::new(py); // TODO: populate scope
+                        let scope = PyDict::new(py);
+                        
+                        let _ = scope.set_item("method", parts_clone.method.as_str());
+                        let _ = scope.set_item("path", parts_clone.uri.path());
+                        let _ = scope.set_item("query_string", parts_clone.uri.query().unwrap_or("").as_bytes());
+
+                        let headers = PyList::empty(py);
+                        for (name, value) in parts_clone.headers.iter() {
+                            let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
+                        }
+                        let _ = scope.set_item("headers", headers);
+                        let _ = scope.set_item("_body", body_bytes.as_ref());
+
                         let py_req = req_cls.call1((scope,)).expect("failed to create Request");
                         
                         let call_next_obj = Bound::new(py, call_next).expect("failed to create PyCallNext").into_any().unbind();
@@ -494,7 +534,7 @@ impl App {
                             res.unwrap_or(ResponseData { status: 500, body: BodyData::Bytes("Mid error".into()), headers: vec![] }).into_response()
                         }
                         Some((_py_req, next_resp_tx)) = call_rx.recv() => {
-                            let axum_resp = next.run(req).await;
+                            let axum_resp = next.run(Request::from_parts(parts, Body::from(body_clone))).await;
                             // Convert Axum response back to ResponseData for Python
                             // (Simplified: just extraction status and body for now)
                             let status = axum_resp.status().as_u16();
