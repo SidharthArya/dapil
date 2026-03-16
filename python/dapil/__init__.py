@@ -18,7 +18,42 @@ from .routing import APIRouter
 from .openapi import get_openapi, get_swagger_ui_html
 from .depends import Depends
 
-async def _resolve_params(handler: Callable, request: Request, path_kwargs: Dict[str, Any], cache: Dict[Any, Any]):
+def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
+    schema = []
+    seen = set()
+    
+    def _extract(func):
+        if func in seen: return
+        seen.add(func)
+        sig = inspect.signature(func)
+        for name, param in sig.parameters.items():
+            if name == "request" or (hasattr(param.annotation, "__name__") and param.annotation.__name__ == "Request"):
+                continue
+            
+            if isinstance(param.default, Depends):
+                if param.default.dependency:
+                    _extract(param.default.dependency)
+                continue
+                
+            if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
+                schema.append({"name": name, "source": "body", "type": "json"})
+            else:
+                is_path_param = f"{{{name}}}" in path
+                source = "path" if is_path_param else "query"
+                type_str = "str"
+                if param.annotation is int:
+                    type_str = "int"
+                elif param.annotation is float:
+                    type_str = "float"
+                elif param.annotation is bool:
+                    type_str = "bool"
+                if not any(s["name"] == name for s in schema):
+                    schema.append({"name": name, "source": source, "type": type_str})
+                
+    _extract(handler)
+    return schema
+
+async def _resolve_params(handler: Callable, request: Request, kwargs: Dict[str, Any], cache: Dict[Any, Any]):
     sig = inspect.signature(handler)
     call_args = {}
     
@@ -26,14 +61,13 @@ async def _resolve_params(handler: Callable, request: Request, path_kwargs: Dict
         if isinstance(param.default, Depends):
             dependency = param.default.dependency
             if dependency is None:
-                # If dependency is not set, we can't do anything
                 continue
             
             if param.default.use_cache and dependency in cache:
                 call_args[name] = cache[dependency]
                 continue
                 
-            dep_kwargs = await _resolve_params(dependency, request, path_kwargs, cache)
+            dep_kwargs = await _resolve_params(dependency, request, kwargs, cache)
             if inspect.iscoroutinefunction(dependency):
                 res = await dependency(**dep_kwargs)
             else:
@@ -46,38 +80,23 @@ async def _resolve_params(handler: Callable, request: Request, path_kwargs: Dict
             
         elif param.annotation is Request or name == "request":
             call_args[name] = request
-        elif name in path_kwargs:
-            val = path_kwargs[name]
-            if param.annotation is int:
-                try:
-                    call_args[name] = int(val)
-                except ValueError:
-                    raise HTTPException(status_code=400, detail=f"Path parameter '{name}' must be an integer")
+        elif name in kwargs:
+            val = kwargs[name]
+            if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
+                if isinstance(val, dict):
+                    try:
+                        call_args[name] = param.annotation(**val)
+                    except ValidationError as e:
+                        raise HTTPException(status_code=422, detail=e.errors())
+                else:
+                    call_args[name] = val
             else:
                 call_args[name] = val
-        elif name in request.query_params:
-            val = request.query_params[name]
-            if param.annotation is int:
-                try:
-                    call_args[name] = int(val)
-                except ValueError:
-                    raise HTTPException(status_code=400, detail=f"Query parameter '{name}' must be an integer")
+        else:
+            if param.default is not inspect.Parameter.empty:
+                call_args[name] = param.default
             else:
-                call_args[name] = val
-        elif BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
-            try:
-                if "body_json" not in cache:
-                    cache["body_json"] = await request.json()
-                body_json = cache["body_json"]
-            except Exception:
-                raise HTTPException(status_code=400, detail="Invalid JSON body")
-            
-            try:
-                call_args[name] = param.annotation(**body_json)
-            except ValidationError as e:
-                raise HTTPException(status_code=422, detail=e.errors())
-            except Exception as e:
-                raise HTTPException(status_code=422, detail=str(e))
+                raise HTTPException(status_code=400, detail=f"Missing parameter '{name}'")
     return call_args
 
 def _wrap_handler(handler: Callable):
@@ -153,9 +172,9 @@ class App:
         
     def route(self, method: str, path: str):
         def decorator(func: Callable):
+            schema = _build_route_schema(func, path)
             wrapped = _wrap_handler(func)
-            # Use the wrapper but keep original name for logging/debugging if needed
-            self._app.route(method, path, wrapped)
+            self._app.route(method, path, wrapped, schema)
             self.routes.append({
                 "method": method,
                 "path": path,
@@ -172,12 +191,13 @@ class App:
             full_path = prefix + path
             if not full_path.startswith("/"):
                 full_path = "/" + full_path
+            schema = _build_route_schema(handler, full_path)
             self.routes.append({
                 "method": method,
                 "path": full_path,
                 "func": handler,
             })
-            self._app.route(method, full_path, _wrap_handler(handler))
+            self._app.route(method, full_path, _wrap_handler(handler), schema)
 
     def get(self, path: str):
         return self.route("GET", path)

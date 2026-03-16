@@ -107,7 +107,7 @@ enum Task {
     Handler {
         handler: PyHandler,
         request: Py<PyAny>,
-        params: std::collections::HashMap<String, String>,
+        kwargs: Py<PyDict>,
         resp_tx: oneshot::Sender<ResponseData>,
     },
     Middleware {
@@ -120,13 +120,48 @@ enum Task {
 
 // Custom Clone removed as Arc provides it
 
+#[derive(Clone, Debug)]
+struct ParamDef {
+    name: String,
+    source: String,
+    param_type: String,
+}
+
+fn json_to_py(py: Python, val: &serde_json::Value) -> PyObject {
+    use pyo3::ToPyObject;
+    match val {
+        serde_json::Value::Null => py.None(),
+        serde_json::Value::Bool(b) => b.to_object(py),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() { i.to_object(py) }
+            else if let Some(f) = n.as_f64() { f.to_object(py) }
+            else { py.None() }
+        },
+        serde_json::Value::String(s) => s.to_object(py),
+        serde_json::Value::Array(arr) => {
+            let list = pyo3::types::PyList::empty(py);
+            for item in arr {
+                let _ = list.append(json_to_py(py, item));
+            }
+            list.into()
+        },
+        serde_json::Value::Object(obj) => {
+            let dict = pyo3::types::PyDict::new(py);
+            for (k, v) in obj {
+                let _ = dict.set_item(k, json_to_py(py, v));
+            }
+            dict.into()
+        }
+    }
+}
+
 #[pyclass]
 struct App {
     host: String,
     port: u16,
     workers: usize,
     // Store routes as (path, method) -> handler
-    routes: Vec<(String, String, PyHandler)>,
+    routes: Vec<(String, String, PyHandler, PyObject)>,
     middlewares: Vec<PyMiddleware>,
 }
 
@@ -161,24 +196,24 @@ impl App {
         self.workers = workers;
     }
 
-    fn route(&mut self, method: String, path: String, handler: PyObject) {
-        self.routes.push((path, method.to_uppercase(), PyHandler(Arc::new(handler))));
+    fn route(&mut self, method: String, path: String, handler: PyObject, schema: PyObject) {
+        self.routes.push((path, method.to_uppercase(), PyHandler(Arc::new(handler)), schema));
     }
 
-    fn get(&mut self, path: String, handler: PyObject) {
-        self.route("GET".to_string(), path, handler);
+    fn get(&mut self, path: String, handler: PyObject, schema: PyObject) {
+        self.route("GET".to_string(), path, handler, schema);
     }
 
-    fn post(&mut self, path: String, handler: PyObject) {
-        self.route("POST".to_string(), path, handler);
+    fn post(&mut self, path: String, handler: PyObject, schema: PyObject) {
+        self.route("POST".to_string(), path, handler, schema);
     }
 
-    fn put(&mut self, path: String, handler: PyObject) {
-        self.route("PUT".to_string(), path, handler);
+    fn put(&mut self, path: String, handler: PyObject, schema: PyObject) {
+        self.route("PUT".to_string(), path, handler, schema);
     }
 
-    fn delete(&mut self, path: String, handler: PyObject) {
-        self.route("DELETE".to_string(), path, handler);
+    fn delete(&mut self, path: String, handler: PyObject, schema: PyObject) {
+        self.route("DELETE".to_string(), path, handler, schema);
     }
 
     fn serve_default(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -244,20 +279,13 @@ impl App {
             while let Ok(task) = rx.recv() {
                 let _ = Python::with_gil(|py| -> PyResult<()> {
                     match task {
-                        Task::Handler { handler, request, params, resp_tx } => {
+                        Task::Handler { handler, request, kwargs, resp_tx } => {
                             let mut args_vec = Vec::new();
                             args_vec.push(request);
                             let args = pyo3::types::PyTuple::new(py, args_vec)?;
-                            let kwargs = pyo3::types::PyDict::new(py);
-                            for (k, v) in params {
-                                if let Ok(i) = v.parse::<i64>() {
-                                    let _ = kwargs.set_item(k, i);
-                                } else {
-                                    let _ = kwargs.set_item(k, v);
-                                }
-                            }
+                            let kwargs_bound = kwargs.bind(py);
 
-                            let mut result_obj = match handler.0.bind(py).call(args, Some(&kwargs)) {
+                            let mut result_obj = match handler.0.bind(py).call(args, Some(kwargs_bound)) {
                                 Ok(res) => res,
                                 Err(e) => {
                                     if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
@@ -423,13 +451,37 @@ impl App {
         });
 
         // Clone routes to avoid holding a borrow on self during router construction
-        let routes_copy: Vec<(String, String, PyHandler)> = self.routes.clone();
+        let routes_copy: Vec<(String, String, PyHandler, PyObject)> = Python::with_gil(|py| {
+            self.routes.iter().map(|(p, m, h, s)| (p.clone(), m.clone(), h.clone(), s.clone_ref(py))).collect()
+        });
 
-        for (path, method, handler) in routes_copy {
+        for (path, method, handler, schema) in routes_copy {
+            let mut params_schema: Vec<ParamDef> = Vec::new();
+            Python::with_gil(|py| {
+                if let Ok(schema_list) = schema.bind(py).downcast::<PyList>() {
+                    for item in schema_list {
+                        if let Ok(dict) = item.downcast::<PyDict>() {
+                            if let (Ok(Some(name_obj)), Ok(Some(source_obj)), Ok(Some(type_obj))) = (
+                                dict.get_item("name"),
+                                dict.get_item("source"),
+                                dict.get_item("type"),
+                            ) {
+                                params_schema.push(ParamDef {
+                                    name: name_obj.extract::<String>().unwrap_or_default(),
+                                    source: source_obj.extract::<String>().unwrap_or_default(),
+                                    param_type: type_obj.extract::<String>().unwrap_or_default(),
+                                });
+                            }
+                        }
+                    }
+                }
+            });
+
             let tx_clone = tx.clone();
             let axum_path = path.replace('{', ":").replace('}', "");
             
             let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: Request| {
+                let params_schema = params_schema.clone();
                 let params = params.0;
                 let h = handler.clone();
                 let tx_inner = tx_clone.clone();
@@ -446,7 +498,8 @@ impl App {
                         
                         let _ = scope.set_item("method", parts.method.as_str());
                         let _ = scope.set_item("path", parts.uri.path());
-                        let _ = scope.set_item("query_string", parts.uri.query().unwrap_or("").as_bytes());
+                        let query_string = parts.uri.query().unwrap_or("");
+                        let _ = scope.set_item("query_string", query_string.as_bytes());
                         
                         let headers = PyList::empty(py);
                         for (name, value) in parts.headers.iter() {
@@ -455,13 +508,56 @@ impl App {
                         let _ = scope.set_item("headers", headers);
                         let _ = scope.set_item("_body", body_bytes.as_ref());
 
-                        req_cls.call1((scope,)).expect("failed to create Request").unbind()
+                        let req_obj = req_cls.call1((scope,)).expect("failed to create Request").unbind();
+                        
+                        let kwargs = PyDict::new(py);
+                        
+                        let mut query_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                        if !query_string.is_empty() {
+                            for (k, v) in form_urlencoded::parse(query_string.as_bytes()).into_owned() {
+                                query_map.insert(k, v);
+                            }
+                        }
+
+                        for pdef in &params_schema {
+                            match pdef.source.as_str() {
+                                "path" => {
+                                    if let Some(val) = params.get(&pdef.name) {
+                                        match pdef.param_type.as_str() {
+                                            "int" => if let Ok(i) = val.parse::<i64>() { let _ = kwargs.set_item(&pdef.name, i); },
+                                            "float" => if let Ok(f) = val.parse::<f64>() { let _ = kwargs.set_item(&pdef.name, f); },
+                                            "bool" => if let Ok(b) = val.parse::<bool>() { let _ = kwargs.set_item(&pdef.name, b); },
+                                            _ => { let _ = kwargs.set_item(&pdef.name, val); }
+                                        }
+                                    }
+                                },
+                                "query" => {
+                                    if let Some(val) = query_map.get(&pdef.name) {
+                                        match pdef.param_type.as_str() {
+                                            "int" => if let Ok(i) = val.parse::<i64>() { let _ = kwargs.set_item(&pdef.name, i); },
+                                            "float" => if let Ok(f) = val.parse::<f64>() { let _ = kwargs.set_item(&pdef.name, f); },
+                                            "bool" => if let Ok(b) = val.parse::<bool>() { let _ = kwargs.set_item(&pdef.name, b); },
+                                            _ => { let _ = kwargs.set_item(&pdef.name, val); }
+                                        }
+                                    }
+                                },
+                                "body" => {
+                                    if pdef.param_type == "json" && !body_bytes.is_empty() {
+                                        if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                                            let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
+                                        }
+                                    }
+                                },
+                                _ => {}
+                            }
+                        }
+                        (req_obj, kwargs.into())
                     });
 
                     let _ = tx_inner.send(Task::Handler {
                         handler: h,
-                        request: py_req,
-                        params,
+                        request: py_req.0,
+                        kwargs: py_req.1,
                         resp_tx,
                     });
                     resp_rx.await.unwrap_or(ResponseData {
