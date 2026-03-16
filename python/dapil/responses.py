@@ -24,3 +24,24 @@ class StreamingResponse(Response):
         media_type: Optional[str] = None,
     ) -> None:
         super().__init__(content, status_code, headers, media_type)
+
+class HTMLResponse(Response):
+    def __init__(
+        self,
+        content: Any = None,
+        status_code: int = 200,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        super().__init__(content, status_code, headers, media_type="text/html")
+
+class JSONResponse(Response):
+    def __init__(
+        self,
+        content: Any = None,
+        status_code: int = 200,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> None:
+        import json
+        if not isinstance(content, (str, bytes)):
+            content = json.dumps(content)
+        super().__init__(content, status_code, headers, media_type="application/json")

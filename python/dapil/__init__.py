@@ -11,10 +11,11 @@ except ImportError:
 
 from ._dapil import App as _App, setup_logging
 from .exceptions import HTTPException
-from .responses import Response, StreamingResponse
+from .responses import Response, StreamingResponse, HTMLResponse, JSONResponse
 from .requests import Request
 from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
+from .openapi import get_openapi, get_swagger_ui_html
 
 def _wrap_handler(handler: Callable):
     sig = inspect.signature(handler)
@@ -81,24 +82,76 @@ def _wrap_handler(handler: Callable):
     return wrapper
 
 class App:
-    def __init__(self):
+    def __init__(
+        self,
+        title: str = "Dapil API",
+        version: str = "0.1.0",
+        openapi_url: Optional[str] = "/openapi.json",
+        docs_url: Optional[str] = "/docs",
+        description: Optional[str] = None,
+    ):
+        self.title = title
+        self.version = version
+        self.openapi_url = openapi_url
+        self.docs_url = docs_url
+        self.description = description
+        
         self._app = _App()
         self.middlewares = []
+        self.routes = []
+        
+        self._setup_docs()
+        
+    def _setup_docs(self):
+        if self.openapi_url:
+            @self.get(self.openapi_url)
+            def openapi_schema():
+                return JSONResponse(
+                    get_openapi(
+                        title=self.title,
+                        version=self.version,
+                        routes=self.routes,
+                        description=self.description,
+                    )
+                )
+
+        if self.docs_url and self.openapi_url:
+            @self.get(self.docs_url)
+            def swagger_ui_html():
+                return HTMLResponse(
+                    get_swagger_ui_html(
+                        openapi_url=self.openapi_url,
+                        title=f"{self.title} - Swagger UI",
+                    )
+                )
         
     def route(self, method: str, path: str):
         def decorator(func: Callable):
             wrapped = _wrap_handler(func)
             # Use the wrapper but keep original name for logging/debugging if needed
             self._app.route(method, path, wrapped)
+            self.routes.append({
+                "method": method,
+                "path": path,
+                "func": func,
+            })
             return func
         return decorator
         
     def add_middleware(self, middleware_class: type, **options: Any):
         self._app.add_middleware_instance(middleware_class(self, **options))
 
-    def include_router(self, router: APIRouter):
+    def include_router(self, router: APIRouter, prefix: str = ""):
         for method, path, handler in router.routes:
-            self._app.route(method, path, _wrap_handler(handler))
+            full_path = prefix + path
+            if not full_path.startswith("/"):
+                full_path = "/" + full_path
+            self.routes.append({
+                "method": method,
+                "path": full_path,
+                "func": handler,
+            })
+            self._app.route(method, full_path, _wrap_handler(handler))
 
     def get(self, path: str):
         return self.route("GET", path)
