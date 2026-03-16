@@ -16,52 +16,78 @@ from .requests import Request
 from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
 from .openapi import get_openapi, get_swagger_ui_html
+from .depends import Depends
+
+async def _resolve_params(handler: Callable, request: Request, path_kwargs: Dict[str, Any], cache: Dict[Any, Any]):
+    sig = inspect.signature(handler)
+    call_args = {}
+    
+    for name, param in sig.parameters.items():
+        if isinstance(param.default, Depends):
+            dependency = param.default.dependency
+            if dependency is None:
+                # If dependency is not set, we can't do anything
+                continue
+            
+            if param.default.use_cache and dependency in cache:
+                call_args[name] = cache[dependency]
+                continue
+                
+            dep_kwargs = await _resolve_params(dependency, request, path_kwargs, cache)
+            if inspect.iscoroutinefunction(dependency):
+                res = await dependency(**dep_kwargs)
+            else:
+                res = dependency(**dep_kwargs)
+                
+            if param.default.use_cache:
+                cache[dependency] = res
+            call_args[name] = res
+            continue
+            
+        elif param.annotation is Request or name == "request":
+            call_args[name] = request
+        elif name in path_kwargs:
+            val = path_kwargs[name]
+            if param.annotation is int:
+                try:
+                    call_args[name] = int(val)
+                except ValueError:
+                    raise HTTPException(status_code=400, detail=f"Path parameter '{name}' must be an integer")
+            else:
+                call_args[name] = val
+        elif name in request.query_params:
+            val = request.query_params[name]
+            if param.annotation is int:
+                try:
+                    call_args[name] = int(val)
+                except ValueError:
+                    raise HTTPException(status_code=400, detail=f"Query parameter '{name}' must be an integer")
+            else:
+                call_args[name] = val
+        elif BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
+            try:
+                if "body_json" not in cache:
+                    cache["body_json"] = await request.json()
+                body_json = cache["body_json"]
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid JSON body")
+            
+            try:
+                call_args[name] = param.annotation(**body_json)
+            except ValidationError as e:
+                raise HTTPException(status_code=422, detail=e.errors())
+            except Exception as e:
+                raise HTTPException(status_code=422, detail=str(e))
+    return call_args
 
 def _wrap_handler(handler: Callable):
-    sig = inspect.signature(handler)
-    params = sig.parameters
     is_async = inspect.iscoroutinefunction(handler)
 
     @functools.wraps(handler)
     async def wrapper(request: Request, **kwargs):
         try:
-            call_args = {}
-            for name, param in params.items():
-                if param.annotation is Request or name == "request":
-                    call_args[name] = request
-                elif name in kwargs:
-                    # Path param
-                    val = kwargs[name]
-                    if param.annotation is int:
-                        try:
-                            call_args[name] = int(val)
-                        except ValueError:
-                            raise HTTPException(status_code=400, detail=f"Path parameter '{name}' must be an integer")
-                    else:
-                        call_args[name] = val
-                elif name in request.query_params:
-                    # Query param
-                    val = request.query_params[name]
-                    if param.annotation is int:
-                        try:
-                            call_args[name] = int(val)
-                        except ValueError:
-                            raise HTTPException(status_code=400, detail=f"Query parameter '{name}' must be an integer")
-                    else:
-                        call_args[name] = val
-                elif BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
-                    # Pydantic model from body
-                    try:
-                        body_json = await request.json()
-                    except Exception:
-                        raise HTTPException(status_code=400, detail="Invalid JSON body")
-                    
-                    try:
-                        call_args[name] = param.annotation(**body_json)
-                    except ValidationError as e:
-                        raise HTTPException(status_code=422, detail=e.errors())
-                    except Exception as e:
-                        raise HTTPException(status_code=422, detail=str(e))
+            cache = {}
+            call_args = await _resolve_params(handler, request, kwargs, cache)
             
             if is_async:
                 res = await handler(**call_args)

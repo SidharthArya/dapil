@@ -5,6 +5,78 @@ try:
 except ImportError:
     BaseModel = None
 
+from .depends import Depends
+
+
+def _get_route_parameters(func: Callable, path: str, components_schemas: Dict[str, Any], seen_deps: Optional[set] = None):
+    if seen_deps is None:
+        seen_deps = set()
+    
+    parameters = []
+    request_body = None
+    
+    if func in seen_deps:
+        return parameters, request_body
+    seen_deps.add(func)
+
+    sig = inspect.signature(func)
+    for name, param in sig.parameters.items():
+        if name == "request" or (hasattr(param.annotation, "__name__") and param.annotation.__name__ == "Request"):
+            continue
+
+        if isinstance(param.default, Depends):
+            if param.default.dependency:
+                sub_params, sub_body = _get_route_parameters(param.default.dependency, path, components_schemas, seen_deps)
+                parameters.extend(sub_params)
+                if sub_body:
+                    request_body = sub_body
+            continue
+
+        # Check if it's a Pydantic model (request body)
+        if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
+            model_name = param.annotation.__name__
+            
+            # Add to components.schemas if not exists
+            if model_name not in components_schemas:
+                if hasattr(param.annotation, "model_json_schema"):
+                    components_schemas[model_name] = param.annotation.model_json_schema()
+                else:
+                    components_schemas[model_name] = param.annotation.schema()
+
+            request_body = {
+                "content": {
+                    "application/json": {
+                        "schema": {"$ref": f"#/components/schemas/{model_name}"}
+                    }
+                },
+                "required": True,
+            }
+        else:
+            # Path or Query parameter
+            # Weak heuristic: if name is in the path format {name}, it's a path param.
+            # Since we don't have a rigid router parsing here, we check path string.
+            is_path_param = f"{{{name}}}" in path
+            param_in = "path" if is_path_param else "query"
+            
+            schema = {"type": "string"}
+            if param.annotation is int:
+                schema["type"] = "integer"
+            elif param.annotation is bool:
+                schema["type"] = "boolean"
+            elif param.annotation is float:
+                schema["type"] = "number"
+
+            param_dict = {
+                "name": name,
+                "in": param_in,
+                "required": param.default == inspect.Parameter.empty,
+                "schema": schema,
+            }
+            # Only add to parameters if not already in there to avoid duplicates from multi-depends
+            if not any(p["name"] == name and p["in"] == param_in for p in parameters):
+                parameters.append(param_dict)
+
+    return parameters, request_body
 
 def get_openapi(
     title: str,
@@ -54,55 +126,7 @@ def get_openapi(
         if func.__doc__:
             operation["description"] = inspect.cleandoc(func.__doc__)
 
-        parameters = []
-        request_body = None
-
-        sig = inspect.signature(func)
-        for name, param in sig.parameters.items():
-            if name == "request" or param.annotation.__name__ == "Request":
-                continue
-
-            # Check if it's a Pydantic model (request body)
-            if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
-                model_name = param.annotation.__name__
-                
-                # Add to components.schemas if not exists
-                if model_name not in components_schemas:
-                    if hasattr(param.annotation, "model_json_schema"):
-                        components_schemas[model_name] = param.annotation.model_json_schema()
-                    else:
-                        components_schemas[model_name] = param.annotation.schema()
-
-                request_body = {
-                    "content": {
-                        "application/json": {
-                            "schema": {"$ref": f"#/components/schemas/{model_name}"}
-                        }
-                    },
-                    "required": True,
-                }
-            else:
-                # Path or Query parameter
-                # Weak heuristic: if name is in the path format {name}, it's a path param.
-                # Since we don't have a rigid router parsing here, we check path string.
-                is_path_param = f"{{{name}}}" in path
-                param_in = "path" if is_path_param else "query"
-                
-                schema = {"type": "string"}
-                if param.annotation is int:
-                    schema["type"] = "integer"
-                elif param.annotation is bool:
-                    schema["type"] = "boolean"
-                elif param.annotation is float:
-                    schema["type"] = "number"
-
-                param_dict = {
-                    "name": name,
-                    "in": param_in,
-                    "required": param.default == inspect.Parameter.empty,
-                    "schema": schema,
-                }
-                parameters.append(param_dict)
+        parameters, request_body = _get_route_parameters(func, path, components_schemas)
 
         if parameters:
             operation["parameters"] = parameters
