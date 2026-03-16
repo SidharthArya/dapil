@@ -1,17 +1,26 @@
+from typing import Any
 from ._dapil import App as _App, setup_logging
 from .exceptions import HTTPException
 from .responses import Response, StreamingResponse
+from .requests import Request
+from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
 
 class App:
     def __init__(self):
         self._app = _App()
+        self.middlewares = []
         
     def route(self, method: str, path: str):
         def decorator(func):
             self._app.route(method, path, func)
-            return func
         return decorator
+        
+    def add_middleware(self, middleware_class: type, **options: Any):
+        # We need to instantiate the middleware with the app
+        # In Starlette, this is typically done by the app itself
+        # Here we'll pass the class and options to the Rust core
+        self._app.add_middleware_instance(middleware_class(self, **options))
 
     def get(self, path: str):
         return self.route("GET", path)
@@ -25,23 +34,19 @@ class App:
     def delete(self, path: str):
         return self.route("DELETE", path)
 
-    def include_router(self, router: APIRouter, prefix: str = ""):
-        for method, path, handler in router.routes:
-            full_path = prefix + path
-            # Ensure path starts with /
-            if not full_path.startswith("/"):
-                full_path = "/" + full_path
-            self._app.route(method, full_path, handler)
-
-    def serve(self, workers: int = 1):
-        self._app.set_workers(workers)
+    def serve(self):
         self._app.serve()
 
-    def serve_default(self):
-        self._app.serve_default()
-    
-    def set_host(self, host: str):
+    def host(self, host: str):
         self._app.set_host(host)
-        
-    def set_port(self, port: int):
+        return self
+
+    def port(self, port: int):
         self._app.set_port(port)
+        return self
+
+    def workers(self, workers: int):
+        self._app.set_workers(workers)
+        return self
+
+Dapil = App
