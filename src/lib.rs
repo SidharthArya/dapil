@@ -15,12 +15,14 @@ use tokio::sync::{oneshot, mpsc};
 use axum::{
     response::{IntoResponse, Response},
     http::{StatusCode, HeaderMap, HeaderName, HeaderValue},
-    extract::{Request, Path},
+    extract::{Request as AxumRequest, Path},
     body::Body,
 };
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 use tokio_stream::StreamExt;
+use form_urlencoded;
+use serde_json;
 
 enum BodyData {
     Bytes(Vec<u8>),
@@ -209,6 +211,59 @@ fn py_response_to_axum(py: Python, py_resp: Option<&Bound<'_, PyAny>>) -> axum::
     axum::response::Response::builder().status(500).body("Unsupported result".into()).unwrap()
 }
 
+#[pyclass(name = "Request")]
+pub struct DapilRequest {
+    #[pyo3(get)]
+    pub method: String,
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub query_string: String,
+    pub headers: HeaderMap,
+    pub body_bytes: axum::body::Bytes,
+}
+
+#[pymethods]
+impl DapilRequest {
+    #[getter]
+    fn headers<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new(py);
+        for (name, value) in &self.headers {
+            if let Ok(v) = value.to_str() {
+                dict.set_item(name.as_str(), v)?;
+            }
+        }
+        Ok(dict)
+    }
+
+    #[getter]
+    fn query_params<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
+        let dict = PyDict::new(py);
+        for (k, v) in form_urlencoded::parse(self.query_string.as_bytes()) {
+            dict.set_item(k, v)?;
+        }
+        Ok(dict)
+    }
+
+    #[getter]
+    fn url(&self, py: Python) -> PyResult<PyObject> {
+        let dict = PyDict::new(py);
+        dict.set_item("path", &self.path)?;
+        dict.set_item("query", &self.query_string)?;
+        Ok(dict.into())
+    }
+
+    fn body<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, pyo3::types::PyBytes>> {
+        Ok(pyo3::types::PyBytes::new(py, &self.body_bytes))
+    }
+
+    fn json(&self, py: Python) -> PyResult<PyObject> {
+        let val: serde_json::Value = serde_json::from_slice(&self.body_bytes)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(json_to_py(py, &val))
+    }
+}
+
 fn handle_py_error(py: Python, e: pyo3::PyErr) -> axum::response::Response {
     if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
         let val = e.value(py);
@@ -356,11 +411,6 @@ impl App {
             let locals = Python::with_gil(|py| pyo3_async_runtimes::tokio::get_current_locals(py).unwrap());
             let locals_arc = Arc::new(locals);
             
-            let req_cls = Python::with_gil(|py| {
-                let dapil = py.import("dapil").expect("failed to import dapil");
-                Arc::new(dapil.getattr("Request").expect("failed to get Request class").unbind())
-            });
-
             let mut router = Router::new();
 
             let is_routes_empty = routes_copy.is_empty();
@@ -369,7 +419,6 @@ impl App {
                 let handler = handler.clone();
                 let path = path.clone();
                 let locals_arc = locals_arc.clone();
-                let req_cls = req_cls.clone();
 
                 let is_async = Python::with_gil(|py| {
                     match py.import("inspect") {
@@ -383,6 +432,7 @@ impl App {
 
                 let mut params_schema: Vec<ParamDef> = Vec::new();
                 let mut needs_body = false;
+                let mut needs_query = false;
                 Python::with_gil(|py| {
                     if let Ok(schema_list) = schema.bind(py).downcast::<PyList>() {
                         for item in schema_list {
@@ -395,6 +445,8 @@ impl App {
                                     let source = source_obj.extract::<String>().unwrap_or_default();
                                     if source == "body" {
                                         needs_body = true;
+                                    } else if source == "query" {
+                                        needs_query = true;
                                     }
                                     params_schema.push(ParamDef {
                                         name: name_obj.extract::<String>().unwrap_or_default(),
@@ -409,12 +461,11 @@ impl App {
 
                 let axum_path = path.replace('{', ":").replace('}', "");
                 
-                let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: Request| {
+                let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: AxumRequest| {
                     let params_schema = params_schema.clone();
                     let params = params.0;
                     let h = handler.clone();
                     let locals_clone = locals_arc.clone();
-                    let req_cls = req_cls.clone();
                     async move {
                         let locals_for_scope = Python::with_gil(|py| locals_clone.clone_ref(py));
                         pyo3_async_runtimes::tokio::scope(locals_for_scope, async move {
@@ -432,31 +483,20 @@ impl App {
                             }
 
                             let result = Python::with_gil(|py| -> ExecResult {
-                                let req_cls = req_cls.bind(py);
-                                let scope = PyDict::new(py);
-                                
-                                let _ = scope.set_item("method", parts.method.as_str());
-                                let _ = scope.set_item("path", parts.uri.path());
-                                let query_string = parts.uri.query().unwrap_or("");
-                                let _ = scope.set_item("query_string", query_string.as_bytes());
-                                
-                                let headers = PyList::empty(py);
-                                for (name, value) in parts.headers.iter() {
-                                    let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
-                                }
-                                let _ = scope.set_item("headers", headers);
-                                if needs_body {
-                                    let _ = scope.set_item("_body", body_bytes.as_ref());
-                                } else {
-                                    let _ = scope.set_item("_body", b"");
-                                }
-
-                                let req_obj = req_cls.call1((scope,)).expect("failed to create Request");
+                                let query_string = parts.uri.query().unwrap_or("").to_string();
+                                let req_obj = crate::DapilRequest {
+                                    method: parts.method.to_string(),
+                                    path: parts.uri.path().to_string(),
+                                    query_string: query_string.clone(),
+                                    headers: parts.headers.clone(),
+                                    body_bytes: body_bytes.clone(),
+                                };
+                                let py_req = Bound::new(py, req_obj).expect("failed to create Request");
                                 
                                 let kwargs = PyDict::new(py);
                                 
                                 let mut query_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                                if !query_string.is_empty() {
+                                if needs_query && !query_string.is_empty() {
                                     for (k, v) in form_urlencoded::parse(query_string.as_bytes()).into_owned() {
                                         query_map.insert(k, v);
                                     }
@@ -496,7 +536,7 @@ impl App {
                                 }
 
                                 let mut args_vec = Vec::new();
-                                args_vec.push(req_obj.into_any());
+                                args_vec.push(py_req.into_any());
                                 let args = pyo3::types::PyTuple::new(py, args_vec).unwrap();
 
                                 match h.0.bind(py).call(args, Some(&kwargs)) {
@@ -539,7 +579,6 @@ impl App {
             for mw_arc in &middlewares_copy {
                 let mw_arc = mw_arc.clone();
                 let locals_clone = locals_arc.clone();
-                let req_cls = req_cls.clone();
                 
                 let is_mw_async = Python::with_gil(|py| {
                     match mw_arc.bind(py).getattr("dispatch") {
@@ -554,10 +593,9 @@ impl App {
                     }
                 });
 
-                router = router.layer(axum::middleware::from_fn(move |req: Request, next: axum::middleware::Next| {
+                router = router.layer(axum::middleware::from_fn(move |req: AxumRequest, next: axum::middleware::Next| {
                     let mw_arc = mw_arc.clone();
                     let locals_clone = locals_clone.clone();
-                    let req_cls = req_cls.clone();
                     async move {
                         let locals_for_scope = Python::with_gil(|py| locals_clone.clone_ref(py));
                         pyo3_async_runtimes::tokio::scope(locals_for_scope, async move {
@@ -570,31 +608,24 @@ impl App {
 
                             enum MiddlewareExecResult {
                                 Done(axum::response::Response),
-                                CallNext(Request),
+                                CallNext(AxumRequest),
                                 Future(std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<PyObject>> + Send>>),
                             }
 
                             let result = Python::with_gil(|py| -> MiddlewareExecResult {
-                                let mw_obj = mw_arc.clone_ref(py);
-                                let req_cls = req_cls.bind(py);
-                                let scope = PyDict::new(py);
-                                
-                                let _ = scope.set_item("method", parts_clone.method.as_str());
-                                let _ = scope.set_item("path", parts_clone.uri.path());
-                                let _ = scope.set_item("query_string", parts_clone.uri.query().unwrap_or("").as_bytes());
-
-                                let headers = PyList::empty(py);
-                                for (name, value) in parts_clone.headers.iter() {
-                                    let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
-                                }
-                                let _ = scope.set_item("headers", headers);
-                                let _ = scope.set_item("_body", body_bytes.as_ref());
-
-                                let py_req = req_cls.call1((scope,)).expect("failed to create Request");
+                                let query_string = parts_clone.uri.query().unwrap_or("").to_string();
+                                let req_obj = crate::DapilRequest {
+                                    method: parts_clone.method.to_string(),
+                                    path: parts_clone.uri.path().to_string(),
+                                    query_string: query_string.clone(),
+                                    headers: parts_clone.headers.clone(),
+                                    body_bytes: body_bytes.clone(),
+                                };
+                                let py_req = Bound::new(py, req_obj).expect("failed to create Request");
 
                                 let call_next_py = Bound::new(py, PyCallNext { tx: call_tx }).unwrap().into_any().unbind();
 
-                                match mw_obj.bind(py).call_method1("dispatch", (py_req, call_next_py)) {
+                                match mw_arc.bind(py).call_method1("dispatch", (py_req, call_next_py)) {
                                     Ok(res) => {
                                         if is_mw_async {
                                             let fut = pyo3_async_runtimes::tokio::into_future(res).unwrap();
@@ -605,7 +636,7 @@ impl App {
                                     }
                                     Err(e) => {
                                         if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
-                                            MiddlewareExecResult::CallNext(Request::from_parts(parts_clone, Body::from(body_clone)))
+                                            MiddlewareExecResult::CallNext(AxumRequest::from_parts(parts_clone, Body::from(body_clone)))
                                         } else {
                                             MiddlewareExecResult::Done(handle_py_error(py, e))
                                         }
@@ -722,6 +753,7 @@ fn setup_logging() {
 #[pymodule]
 fn _dapil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<App>()?;
+    m.add_class::<DapilRequest>()?;
     m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
     Ok(())
 }

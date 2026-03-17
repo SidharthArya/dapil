@@ -9,10 +9,10 @@ except ImportError:
     BaseModel = None
     ValidationError = None
 
-from ._dapil import App as _App, setup_logging
+from ._dapil import App as _App, setup_logging, Request
 from .exceptions import HTTPException
 from .responses import Response, StreamingResponse, HTMLResponse, JSONResponse
-from .requests import Request
+# from .requests import Request  # Replaced by native Request
 from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
 from .openapi import get_openapi, get_swagger_ui_html
@@ -101,12 +101,63 @@ async def _resolve_params(handler: Callable, request: Request, kwargs: Dict[str,
 
 def _wrap_handler(handler: Callable):
     is_async = inspect.iscoroutinefunction(handler)
+    sig = inspect.signature(handler)
+    
+    # Pre-calculate dependency and parameter mapping
+    params_info = []
+    for name, param in sig.parameters.items():
+        is_request = (param.annotation is Request or name == "request")
+        dependency = param.default.dependency if isinstance(param.default, Depends) else None
+        params_info.append({
+            "name": name,
+            "is_request": is_request,
+            "dependency": dependency,
+            "use_cache": getattr(param.default, "use_cache", True) if dependency else False,
+            "default": param.default if not is_request and not dependency and param.default is not inspect.Parameter.empty else None,
+            "has_default": not is_request and not dependency and param.default is not inspect.Parameter.empty,
+            "annotation": param.annotation
+        })
 
     @functools.wraps(handler)
     async def wrapper(request: Request, **kwargs):
         try:
             cache = {}
-            call_args = await _resolve_params(handler, request, kwargs, cache)
+            call_args = {}
+            
+            for p in params_info:
+                name = p["name"]
+                if p["dependency"]:
+                    dependency = p["dependency"]
+                    if p["use_cache"] and dependency in cache:
+                        call_args[name] = cache[dependency]
+                    else:
+                        # Recursive resolution still needed for dependencies
+                        dep_kwargs = await _resolve_params(dependency, request, kwargs, cache)
+                        if inspect.iscoroutinefunction(dependency):
+                            res = await dependency(**dep_kwargs)
+                        else:
+                            res = dependency(**dep_kwargs)
+                        if p["use_cache"]:
+                            cache[dependency] = res
+                        call_args[name] = res
+                elif p["is_request"]:
+                    call_args[name] = request
+                elif name in kwargs:
+                    val = kwargs[name]
+                    if BaseModel and inspect.isclass(p["annotation"]) and issubclass(p["annotation"], BaseModel):
+                        if isinstance(val, dict):
+                            try:
+                                call_args[name] = p["annotation"](**val)
+                            except ValidationError as e:
+                                raise HTTPException(status_code=422, detail=e.errors())
+                        else:
+                            call_args[name] = val
+                    else:
+                        call_args[name] = val
+                elif p["has_default"]:
+                    call_args[name] = p["default"]
+                else:
+                    raise HTTPException(status_code=400, detail=f"Missing parameter '{name}'")
             
             if is_async:
                 res = await handler(**call_args)
