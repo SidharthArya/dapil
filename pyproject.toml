@@ -13,6 +13,7 @@ classifiers = [
 dynamic = ["version"]
 dependencies = [
     "pydantic>=2.10.6",
+    "orjson>=3.10.15",
 ]
 [tool.maturin]
 features = ["pyo3/extension-module"]
