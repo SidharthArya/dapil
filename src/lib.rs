@@ -180,7 +180,7 @@ unsafe impl Sync for PyHandler {}
 
 // Custom Clone removed as Arc provides it
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ParamDef {
     name: String,
     source: String,
@@ -192,6 +192,7 @@ struct ParamDef {
     min_length: Option<usize>,
     max_length: Option<usize>,
     pattern: Option<String>,
+    validator: Option<Arc<PyObject>>,
 }
 
 fn json_to_py(py: Python, val: &serde_json::Value) -> PyObject {
@@ -540,6 +541,7 @@ impl App {
                                         min_length: dict.get_item("min_length").unwrap_or(None).and_then(|v| v.extract::<usize>().ok()),
                                         max_length: dict.get_item("max_length").unwrap_or(None).and_then(|v| v.extract::<usize>().ok()),
                                         pattern: dict.get_item("pattern").unwrap_or(None).and_then(|v| v.extract::<String>().ok()),
+                                        validator: dict.get_item("validator").unwrap_or(None).and_then(|v| Some(Arc::new(v.into()))),
                                     });
                                 }
                             }
@@ -698,7 +700,26 @@ impl App {
                                         },
                                          "body" => {
                                             if !body_bytes.is_empty() {
-                                                if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                                                if let Some(validator) = &pdef.validator {
+                                                    // High-speed direct Pydantic validation
+                                                    match validator.bind(py).call_method1("validate_json", (pyo3::types::PyBytes::new(py, &body_bytes),)) {
+                                                        Ok(model_instance) => {
+                                                            let _ = kwargs.set_item(&pdef.name, model_instance);
+                                                        }
+                                                        Err(e) => {
+                                                            // Return validation error directly from Rust
+                                                            let error_json = match e.value(py).call_method0("json") {
+                                                                Ok(json_str) => json_str.extract::<String>().unwrap_or_else(|_| "[]".to_string()),
+                                                                Err(_) => format!("\"{}\"", e.value(py).to_string()),
+                                                            };
+                                                            return ExecResult::Done(axum::response::Response::builder()
+                                                                .status(422)
+                                                                .header("content-type", "application/json")
+                                                                .body(axum::body::Body::from(format!("{{\"detail\": {}}}", error_json)))
+                                                                .unwrap());
+                                                        }
+                                                    }
+                                                } else if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                                                     if pdef.param_type == "json" {
                                                         let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
                                                     } else if let Some(field_val) = json_val.get(&pdef.name) {

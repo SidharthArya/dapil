@@ -64,7 +64,11 @@ def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
 
             if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
                 source = source or "body"
-                p_schema.update({"source": source, "type": "json"})
+                p_schema.update({
+                    "source": source, 
+                    "type": "json",
+                    "validator": getattr(param.annotation, "__pydantic_validator__", None)
+                })
                 schema.append(p_schema)
             elif param.annotation is UploadFile:
                 source = source or "file"
