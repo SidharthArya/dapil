@@ -53,7 +53,7 @@ run_bench "Native Actix" "./benchmarks/rust_bench/target/release/actix_bench" "h
 run_bench "Dapil" "python examples/hello_world/main.py" "http://127.0.0.1:8181/" 8181
 
 # 3. Competitive Frameworks
-run_bench "Django-Bolt" "python benchmarks/bolt_app.py" "http://127.0.0.1:8084/" 8084
+run_bench "Django-Bolt" "python benchmarks/bolt_app.py" "http://127.0.0.1:8084/api/test" 8084
 run_bench "Django (Gunicorn)" "gunicorn benchmarks.django_app:app --bind 127.0.0.1:8001 --workers 1 --worker-class sync" "http://127.0.0.1:8001/" 8001
 run_bench "FastAPI (Uvicorn)" "uvicorn benchmarks.fastapi_app:app --host 127.0.0.1 --port 8000 --workers 1" "http://127.0.0.1:8000/" 8000
 
