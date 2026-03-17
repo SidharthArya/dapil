@@ -15,18 +15,92 @@ use tokio::sync::{oneshot, mpsc};
 use axum::{
     response::{IntoResponse, Response},
     http::{StatusCode, HeaderMap, HeaderName, HeaderValue},
-    extract::{Request as AxumRequest, Path},
+    extract::{Request as AxumRequest, Path, ws::{Message, WebSocket, WebSocketUpgrade}},
     body::Body,
 };
 use pyo3::types::{PyDict, PyList};
+use pyo3_async_runtimes::tokio::future_into_py;
+use futures_util::{sink::SinkExt, stream::{StreamExt, SplitSink, SplitStream}};
+use tokio::sync::Mutex;
 use std::sync::Arc;
-use tokio_stream::StreamExt;
 use form_urlencoded;
 use serde_json;
 
 enum BodyData {
     Bytes(Vec<u8>),
     Stream(mpsc::Receiver<Vec<u8>>),
+}
+
+#[pyclass]
+struct WebSocketBridge {
+    tx: Arc<Mutex<SplitSink<WebSocket, Message>>>,
+    rx: Arc<Mutex<SplitStream<WebSocket>>>,
+}
+
+#[pymethods]
+impl WebSocketBridge {
+    fn accept<'py>(&self, py: Python<'py>, _subprotocol: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+        future_into_py(py, async move {
+            Ok(())
+        })
+    }
+
+    fn receive_text<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.rx.clone();
+        future_into_py(py, async move {
+            let mut rx = rx.lock().await;
+            while let Some(msg) = rx.next().await {
+                match msg {
+                    Ok(Message::Text(t)) => return Ok(t),
+                    Ok(Message::Close(_)) => break,
+                    _ => continue,
+                }
+            }
+            Err(pyo3::exceptions::PyRuntimeError::new_err("Connection closed"))
+        })
+    }
+
+    fn receive_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let rx = self.rx.clone();
+        future_into_py(py, async move {
+            let mut rx = rx.lock().await;
+            while let Some(msg) = rx.next().await {
+                match msg {
+                    Ok(Message::Binary(b)) => return Ok(b.to_vec()),
+                    Ok(Message::Close(_)) => break,
+                    _ => continue,
+                }
+            }
+            Err(pyo3::exceptions::PyRuntimeError::new_err("Connection closed"))
+        })
+    }
+
+    fn send_text<'py>(&self, py: Python<'py>, data: String) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        future_into_py(py, async move {
+            let mut tx = tx.lock().await;
+            tx.send(Message::Text(data)).await.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn send_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        future_into_py(py, async move {
+            let mut tx = tx.lock().await;
+            tx.send(Message::Binary(data.into())).await.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn close<'py>(&self, py: Python<'py>, _code: Option<u16>, _reason: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        future_into_py(py, async move {
+            let mut tx = tx.lock().await;
+            let _ = tx.close().await;
+            Ok(())
+        })
+    }
 }
 
 struct ResponseData {
@@ -475,6 +549,64 @@ impl App {
 
                 let axum_path = path.replace('{', ":").replace('}', "");
                 
+                if method == "WS" {
+                    let run_ws_handler = move |ws: WebSocketUpgrade, params: Path<std::collections::HashMap<String, String>>, _axum_req: AxumRequest| {
+                        let h = handler.clone();
+                        let locals_clone = locals_arc.clone();
+                        let is_async = is_async;
+                        async move {
+                            ws.on_upgrade(move |socket| async move {
+                                let (tx, rx) = socket.split();
+                                let bridge = WebSocketBridge {
+                                    tx: Arc::new(Mutex::new(tx)),
+                                    rx: Arc::new(Mutex::new(rx)),
+                                };
+                                
+                                let locals_for_scope = Python::with_gil(|py| locals_clone.clone_ref(py));
+                                pyo3_async_runtimes::tokio::scope(locals_for_scope, async move {
+                                    let mut bridge_wrapped_opt = None;
+                                    Python::with_gil(|py| {
+                                        let py_bridge = Bound::new(py, bridge).unwrap();
+                                        let dapil = py.import("dapil").unwrap();
+                                        let ws_cls = dapil.getattr("WebSocket").unwrap();
+                                        let py_ws = ws_cls.call1((py_bridge,)).unwrap();
+                                        bridge_wrapped_opt = Some(py_ws.into_any().unbind());
+                                        
+                                        let kwargs = PyDict::new(py);
+                                        for (k, v) in params.0 {
+                                            let _ = kwargs.set_item(k, v).unwrap();
+                                        }
+
+                                        let args = pyo3::types::PyTuple::new(py, vec![bridge_wrapped_opt.as_ref().unwrap().bind(py).clone()]).unwrap();
+                                        
+                                        match h.0.bind(py).call(args, Some(&kwargs)) {
+                                            Ok(res) => {
+                                                if is_async {
+                                                    match pyo3_async_runtimes::tokio::into_future(res) {
+                                                        Ok(fut) => {
+                                                            tokio::spawn(async move {
+                                                                if let Err(e) = fut.await {
+                                                                    Python::with_gil(|py| e.print(py));
+                                                                }
+                                                            });
+                                                        }
+                                                        Err(e) => e.print(py),
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                e.print(py);
+                                            }
+                                        }
+                                    });
+                                }).await;
+                            })
+                        }
+                    };
+                    router = router.route(&axum_path, routing::get(run_ws_handler));
+                    continue;
+                }
+
                 let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: AxumRequest| {
                     let params_schema = params_schema.clone();
                     let params = params.0;
@@ -888,6 +1020,7 @@ fn setup_logging() {
 fn _dapil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<App>()?;
     m.add_class::<Request>()?;
+    m.add_class::<WebSocketBridge>()?;
     m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
     Ok(())
 }

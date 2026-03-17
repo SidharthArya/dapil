@@ -19,6 +19,7 @@ from .openapi import get_openapi, get_swagger_ui_html
 from .depends import Depends
 from .params import Header, Cookie, Form, File, Param, Path, Query, Body
 from .requests import Request, UploadFile
+from .websockets import WebSocket
 
 def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
     schema = []
@@ -152,14 +153,20 @@ def _wrap_handler(handler: Callable, response_model: Optional[Any] = None):
         })
 
     @functools.wraps(handler)
-    async def wrapper(request: Request, **kwargs):
+    async def wrapper(request: Union[Request, WebSocket], **kwargs):
+        is_websocket = isinstance(request, WebSocket)
         try:
             cache = {}
             call_args = {}
             
             for p in params_info:
                 name = p["name"]
-                if p["dependency"]:
+                if p["annotation"] is WebSocket:
+                    if is_websocket:
+                        call_args[name] = request
+                    else:
+                        raise HTTPException(status_code=400, detail="WebSocket required")
+                elif p["dependency"]:
                     dependency = p["dependency"]
                     if p["use_cache"] and dependency in cache:
                         call_args[name] = cache[dependency]
@@ -221,10 +228,18 @@ def _wrap_handler(handler: Callable, response_model: Optional[Any] = None):
                 return Response(json_dumps(res), status_code=200, headers={"Content-Type": "application/json"})
             return res
         except HTTPException as e:
-            return Response(e.detail if isinstance(e.detail, (str, bytes)) else str(e.detail), status_code=e.status_code, headers={"Content-Type": "text/plain"})
+            if is_websocket:
+                # For Ws, we might want to close with error or just log
+                # For now, let's just re-raise and let Rust handle it?
+                # Actually, Axum doesn't easily turn HTTPException into Ws close
+                raise
+            return Response(json_dumps({"detail": e.detail}), status_code=e.status_code, headers={"Content-Type": "application/json"})
         except Exception as e:
-            error_detail = str(e)
-            return Response(json_dumps({"detail": error_detail}), status_code=500, headers={"Content-Type": "application/json"})
+            import traceback
+            traceback.print_exc()
+            if is_websocket:
+                raise
+            return Response(json_dumps({"detail": str(e)}), status_code=500, headers={"Content-Type": "application/json"})
 
     return wrapper
 
@@ -326,6 +341,20 @@ class App:
     def delete(self, path: str, response_model: Optional[Any] = None):
         return self.route("DELETE", path, response_model=response_model)
 
+    def websocket(self, path: str):
+        def decorator(func: Callable):
+            # WebSocket routes are special, we communicate them differently in schema
+            schema = _build_route_schema(func, path)
+            wrapped = _wrap_handler(func)
+            self._app.route("WS", path, wrapped, schema)
+            self.routes.append({
+                "method": "WS",
+                "path": path,
+                "func": func,
+            })
+            return func
+        return decorator
+
     def serve(self):
         self._app.serve()
 
@@ -347,5 +376,5 @@ __all__ = [
     "Dapil", "App", "Request", "Response", "JSONResponse", "HTMLResponse", 
     "StreamingResponse", "HTTPException", "Depends", "BaseMiddleware",
     "APIRouter", "Header", "Cookie", "Form", "File", "UploadFile",
-    "Path", "Query", "Body"
+    "Path", "Query", "Body", "WebSocket"
 ]

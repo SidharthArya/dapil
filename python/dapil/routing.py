@@ -33,3 +33,17 @@ class APIRouter:
 
     def delete(self, path: str, response_model: Optional[Any] = None):
         return self.route("DELETE", path, response_model=response_model)
+
+    def websocket(self, path: str):
+        def decorator(func: Callable):
+            full_path = self.prefix + path
+            if not full_path.startswith("/"):
+                full_path = "/" + full_path
+            self.routes.append({
+                "method": "WS",
+                "path": full_path,
+                "handler": func,
+                "options": {}
+            })
+            return func
+        return decorator

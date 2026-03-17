@@ -18,7 +18,7 @@ experimental-async = []
 rt-multi-thread = []
 
 [dependencies]
-axum = {version = "0.7.9"}
+axum = {version = "0.7.9", features = ["ws"]}
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 pyo3 = {version = "0.23.1", features = ["extension-module", "experimental-async"]}
