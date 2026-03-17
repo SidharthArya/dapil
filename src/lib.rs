@@ -443,7 +443,7 @@ impl App {
                                 
                                 if let (Ok(Some(name_obj)), Ok(Some(source_obj)), Ok(Some(type_obj))) = (name_res, source_res, type_res) {
                                     let source = source_obj.extract::<String>().unwrap_or_default();
-                                    if source == "body" {
+                                    if source == "body" || source == "form" || source == "file" {
                                         needs_body = true;
                                     } else if source == "query" {
                                         needs_query = true;
@@ -480,6 +480,32 @@ impl App {
                             enum ExecResult {
                                 Done(axum::response::Response),
                                 Future(std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<PyObject>> + Send>>),
+                            }
+
+                            // Pre-extract parameters that might need async or are just easier outside
+                            let mut pre_extracted = std::collections::HashMap::new();
+                            
+                            if needs_body && !body_bytes.is_empty() {
+                                if let Some(content_type) = parts.headers.get(axum::http::header::CONTENT_TYPE) {
+                                    if let Ok(ct_str) = content_type.to_str() {
+                                        if ct_str.starts_with("multipart/form-data") {
+                                            if let Some(boundary) = ct_str.split("boundary=").nth(1) {
+                                                let body_bytes_tmp = body_bytes.clone();
+                                                let data_stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(body_bytes_tmp) });
+                                                let mut multipart = multer::Multipart::new(data_stream, boundary);
+                                                
+                                                while let Ok(Some(field)) = multipart.next_field().await {
+                                                    if let Some(name) = field.name().map(|s| s.to_string()) {
+                                                        let filename = field.file_name().map(|s| s.to_string());
+                                                        let content_type = field.content_type().map(|s| s.to_string());
+                                                        let data = field.bytes().await.unwrap_or_default();
+                                                        pre_extracted.insert(name, (filename, content_type, data));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             let result = Python::with_gil(|py| -> ExecResult {
@@ -529,6 +555,64 @@ impl App {
                                                 if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
                                                     let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
                                                 }
+                                            }
+                                        },
+                                        "header" => {
+                                            // Handle headers (FastAPI-style: hyphens converted to underscores)
+                                            // Header(alias="...") is handled by name being the alias if provided in Python
+                                            let header_name = pdef.name.replace('_', "-");
+                                            if let Some(val) = parts.headers.get(&header_name) {
+                                                if let Ok(s) = val.to_str() {
+                                                    let _ = kwargs.set_item(&pdef.name, s);
+                                                }
+                                            } else {
+                                                // Fallback to exact name if hyphenated version not found
+                                                if let Some(val) = parts.headers.get(&pdef.name) {
+                                                    if let Ok(s) = val.to_str() {
+                                                        let _ = kwargs.set_item(&pdef.name, s);
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "cookie" => {
+                                            if let Some(cookie_header) = parts.headers.get(axum::http::header::COOKIE) {
+                                                if let Ok(cookie_str) = cookie_header.to_str() {
+                                                    for cookie in cookie::Cookie::split_parse(cookie_str) {
+                                                        if let Ok(c) = cookie {
+                                                            if c.name() == pdef.name {
+                                                                let _ = kwargs.set_item(&pdef.name, c.value());
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "form" => {
+                                            if !body_bytes.is_empty() {
+                                                for (k, v) in form_urlencoded::parse(&body_bytes) {
+                                                    if k == pdef.name {
+                                                        let _ = kwargs.set_item(&pdef.name, v);
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "file" => {
+                                            if let Some((filename, ct, data)) = pre_extracted.get(&pdef.name) {
+                                                let dapil = py.import("dapil").unwrap();
+                                                let upload_file_cls = dapil.getattr("UploadFile").unwrap();
+                                                
+                                                let io = py.import("io").unwrap();
+                                                let bytes_io = io.call_method1("BytesIO", (pyo3::types::PyBytes::new(py, data),)).unwrap();
+                                                
+                                                let file_kwargs = PyDict::new(py);
+                                                if let Some(f) = filename { file_kwargs.set_item("filename", f).unwrap(); }
+                                                if let Some(c) = ct { file_kwargs.set_item("content_type", c).unwrap(); }
+                                                file_kwargs.set_item("file", bytes_io).unwrap();
+                                                
+                                                let upload_file = upload_file_cls.call((), Some(&file_kwargs)).unwrap();
+                                                let _ = kwargs.set_item(&pdef.name, upload_file);
                                             }
                                         },
                                         _ => {}

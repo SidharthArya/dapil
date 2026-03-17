@@ -1,6 +1,34 @@
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, BinaryIO
 from urllib.parse import parse_qs
+
+class UploadFile:
+    def __init__(
+        self,
+        file: BinaryIO,
+        *,
+        filename: Optional[str] = None,
+        size: Optional[int] = None,
+        content_type: Optional[str] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ):
+        self.file = file
+        self.filename = filename
+        self.size = size
+        self.content_type = content_type
+        self.headers = headers or {}
+
+    async def read(self, size: int = -1) -> bytes:
+        return self.file.read(size)
+
+    async def write(self, data: bytes) -> None:
+        self.file.write(data)
+
+    async def seek(self, offset: int) -> None:
+        self.file.seek(offset)
+
+    async def close(self) -> None:
+        self.file.close()
 
 class State:
     def __init__(self, state: Optional[Dict[str, Any]] = None):
