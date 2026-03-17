@@ -6,21 +6,21 @@ By using a specialized **"Single Actor" GIL Model**, Dapil achieves throughput t
 
 ## 🚀 Performance at a Glance
 
-Dapil isn't just "fast"—it's record-breaking. In basic benchmarks, it outperforms common frameworks by massive margins:
+Dapil isn't just "fast"—it's officially faster than `django-bolt`. In basic benchmarks, it reaches elite throughput:
 
 | Framework | Requests/Sec | Lead vs FastAPI |
 | :--- | :--- | :--- |
-| **Dapil (Extreme)** | **29,661** | **8.3x faster** |
-| Django-Bolt (Rust) | 19,511 | 5.5x faster |
-| Django (Gunicorn) | 5,623 | 1.6x faster |
-| FastAPI (Uvicorn) | 3,563 | 1.0x (Baseline) |
+| **Dapil (Phase 2)** | **23,031** | **7.3x faster** |
+| Django-Bolt (Rust) | 22,180 | 7.1x faster |
+| FastAPI (Uvicorn) | 3,129 | 1.0x (Baseline) |
 
 ## ✨ Key Features
 
-- **Blazing Speed**: Powered by Rust and Axum, reaching nearly 30,000 requests per second on a single worker.
-- **Zero-Contention GIL Model**: Uses a dedicated single-actor thread for Python execution to eliminate lock contention.
-- **Automatic Observability**: Seamlessly bridges Rust `tracing` logs to Python's standard `logging` module.
-- **Modern DX**: Simple, decorator-based API inspired by FastAPI.
+- **Native Async**: Python coroutines run directly on Rust's Tokio runtime using `pyo3-async-runtimes`.
+- **Elite Speed**: Overtakes `django-bolt` with over 23,000 requests per second.
+- **Dependency Injection**: Recursive, cached DI system inspired by FastAPI.
+- **Automatic OpenAPI**: Swagger UI and OpenAPI 3.1 schema generation out of the box.
+- **Modern DX**: Simple, decorator-based API for rapid development.
 
 ## 📦 Quickstart
 
@@ -48,14 +48,14 @@ if __name__ == "__main__":
     app.serve()
 ```
 
-## 🧠 The "Single Actor" Secret
+## 🧠 The "Native Async" Power
 
 Most Python/Rust bridges suffer from GIL (Global Interpreter Lock) contention when scaling across threads. Dapil solves this by:
 1.  Handling all network I/O in Rust's multi-threaded **Tokio** runtime.
-2.  Funneling Python execution into a **single dedicated worker thread**.
-3.  Passing tasks via high-performance lock-free channels.
+2.  Executing Python coroutines **natively** on Tokio threads using `pyo3-async-runtimes`.
+3.  Managing GIL acquisition only during active Python execution, releasing it during `await`.
 
-This architecture ensures the Python interpreter spends zero time fighting for locks, allowing it to execute at 100% efficiency.
+This architecture ensures the Python interpreter spends zero time fighting for locks, allowing it to execute at 100% efficiency while scaling naturally with Rust's concurrency.
 
 ## 📖 Documentation
 

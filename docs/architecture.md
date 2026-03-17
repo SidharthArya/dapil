@@ -6,37 +6,37 @@ Dapil is designed with a "Rust-First, Python-Friendly" philosophy. It leverages 
 
 In traditional Python/Rust bridges (like those using `spawn_blocking`), multiple threads often compete for the Python Global Interpreter Lock (GIL). This contention creates a bottleneck where threads spend more time waiting for the lock than executing code, severely limiting throughput.
 
-## The Solution: Single Actor GIL Model
+## The Solution: Native Async Coroutine Model
 
-Dapil implements a **Single Actor** pattern for GIL management:
+Dapil implements a **Native Async** pattern for GIL management, executing Python coroutines directly on the Rust Tokio runtime:
 
 ```mermaid
 graph TD
     Client[HTTP Client] --> Axum[Axum/Tokio Rust Runtime]
-    Axum --> Channel[(High-Performance Flume Channel)]
-    Channel --> Worker[Dedicated Python Worker Thread]
-    Worker --> GIL[Acquire GIL]
-    GIL --> Handler[Execute Python Handler]
-    Handler --> Result[Return Result]
-    Result --> Channel
-    Channel --> Axum
+    Axum --> Logic[Rust Request Handler]
+    Logic --> GIL[Acquire GIL]
+    GIL --> Exec[Invoke Python Handler]
+    Exec --> Result{Is Async?}
+    Result -- Yes --> Coro[Convert to Rust Future]
+    Coro -- .await --> Done[Return Result]
+    Result -- No --> Done
+    Done --> Axum
     Axum --> Client
 ```
 
 ### 1. Multi-Threaded I/O (Rust)
 Incoming connections and HTTP parsing are handled by **Tokio**, Rust's industry-standard asynchronous runtime. This allows Dapil to handle massive concurrency (thousands of simultaneous connections) without blocking.
 
-### 2. Isolated Python Execution
-Instead of calling Python handlers directly from the async task (which would require locking/unlocking the GIL constantly), Dapil sends a message to a **dedicated worker thread**.
+### 2. Native Coroutine Awaiting
+Instead of using a dedicated worker thread (which creates a bottleneck), Dapil converts Python coroutines into **native Rust futures** using `pyo3-async-runtimes`.
 
-### 3. Worker Thread (The Actor)
-The worker thread is the only thread that interacts with the Python interpreter. It:
-- Waits for a task on a lock-free channel.
-- Acquires the GIL once.
-- Processes the task.
-- Sends the response back.
+### 3. Smart GIL Management
+Dapil utilizes `pyo3-async-runtimes::tokio::scope` to manage the GIL efficiently across the async boundary.
+- **Acquire Once**: The GIL is acquired only when necessary to call the Python handler.
+- **Release during Await**: While a Python coroutine is "awaiting" (e.g., for DB or network), the GIL is released, allowing other threads to execute Python logic.
+- **Concurrency**: This allows multiple Python coroutines to be in-flight simultaneously on the same actor-like model but with true async suspension.
 
-This "Single Actor" approach ensures that the Python interpreter is always running at peak efficiency, as there is absolutely zero lock contention from other Rust threads.
+This approach ensures that the Python interpreter is always available for work, eliminating the "Single Worker" bottleneck while scaling naturally with Tokio's thread pool.
 
 ## Optimized Memory Management
 
