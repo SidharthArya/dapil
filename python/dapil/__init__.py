@@ -11,7 +11,7 @@ except ImportError:
 
 from ._dapil import App as _App, setup_logging, Request
 from .exceptions import HTTPException
-from .responses import Response, StreamingResponse, HTMLResponse, JSONResponse
+from .responses import Response, StreamingResponse, HTMLResponse, JSONResponse, json_dumps
 # from .requests import Request  # Replaced by native Request
 from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
@@ -165,15 +165,13 @@ def _wrap_handler(handler: Callable):
                 res = handler(**call_args)
 
             if isinstance(res, (dict, list)):
-                import json
-                return Response(json.dumps(res), status_code=200, headers={"Content-Type": "application/json"})
+                return Response(json_dumps(res), status_code=200, headers={"Content-Type": "application/json"})
             return res
         except HTTPException as e:
             return Response(e.detail if isinstance(e.detail, (str, bytes)) else str(e.detail), status_code=e.status_code, headers={"Content-Type": "text/plain"})
         except Exception as e:
-            import json
             error_detail = str(e)
-            return Response(json.dumps({"detail": error_detail}), status_code=500, headers={"Content-Type": "application/json"})
+            return Response(json_dumps({"detail": error_detail}), status_code=500, headers={"Content-Type": "application/json"})
 
     return wrapper
 

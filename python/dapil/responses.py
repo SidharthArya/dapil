@@ -34,6 +34,28 @@ class HTMLResponse(Response):
     ) -> None:
         super().__init__(content, status_code, headers, media_type="text/html")
 
+import json
+from datetime import datetime, date
+from uuid import UUID
+from enum import Enum
+
+class DapilJSONEncoder(json.JSONEncoder):
+    def default(self, obj: Any) -> Any:
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, UUID):
+            return str(obj)
+        if isinstance(obj, Enum):
+            return obj.value
+        if hasattr(obj, "dict") and callable(obj.dict):
+            return obj.dict()
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            return obj.model_dump()
+        return super().default(obj)
+
+def json_dumps(obj: Any, **kwargs: Any) -> str:
+    return json.dumps(obj, cls=DapilJSONEncoder, **kwargs)
+
 class JSONResponse(Response):
     def __init__(
         self,
@@ -41,7 +63,6 @@ class JSONResponse(Response):
         status_code: int = 200,
         headers: Optional[Dict[str, str]] = None,
     ) -> None:
-        import json
         if not isinstance(content, (str, bytes)):
-            content = json.dumps(content)
+            content = json_dumps(content)
         super().__init__(content, status_code, headers, media_type="application/json")
