@@ -133,7 +133,7 @@ async def _resolve_params(handler: Callable, request: Request, kwargs: Dict[str,
                 raise HTTPException(status_code=400, detail=f"Missing parameter '{name}'")
     return call_args
 
-def _wrap_handler(handler: Callable, response_model: Optional[Any] = None):
+def _wrap_handler(handler: Callable, response_model: Optional[Any] = None, exception_handlers: Optional[Dict[Any, Callable]] = None):
     is_async = inspect.iscoroutinefunction(handler)
     sig = inspect.signature(handler)
     
@@ -227,14 +227,24 @@ def _wrap_handler(handler: Callable, response_model: Optional[Any] = None):
             if isinstance(res, (dict, list)):
                 return Response(json_dumps(res), status_code=200, headers={"Content-Type": "application/json"})
             return res
-        except HTTPException as e:
-            if is_websocket:
-                # For Ws, we might want to close with error or just log
-                # For now, let's just re-raise and let Rust handle it?
-                # Actually, Axum doesn't easily turn HTTPException into Ws close
-                raise
-            return Response(json_dumps({"detail": e.detail}), status_code=e.status_code, headers={"Content-Type": "application/json"})
         except Exception as e:
+            # Check for custom exception handlers
+            if exception_handlers:
+                # Check MRO for exact or base class handlers
+                for cls in type(e).__mro__:
+                    if cls in exception_handlers:
+                        exc_handler = exception_handlers[cls]
+                        return await exc_handler(request, e)
+
+            if isinstance(e, HTTPException):
+                if is_websocket:
+                    raise
+                content = e.detail if not isinstance(e.detail, (str, bytes, dict, list)) else e.detail
+                if isinstance(content, (str, bytes)):
+                    content = {"detail": content if isinstance(content, str) else content.decode("utf-8")}
+                
+                return JSONResponse(status_code=e.status_code, content=content)
+            
             import traceback
             traceback.print_exc()
             if is_websocket:
@@ -261,6 +271,7 @@ class App:
         self._app = _App()
         self.middlewares = []
         self.routes = []
+        self.exception_handlers = {}
         
         self._setup_docs()
         
@@ -290,7 +301,7 @@ class App:
     def route(self, method: str, path: str, response_model: Optional[Any] = None):
         def decorator(func: Callable):
             schema = _build_route_schema(func, path)
-            wrapped = _wrap_handler(func, response_model=response_model)
+            wrapped = _wrap_handler(func, response_model=response_model, exception_handlers=self.exception_handlers)
             self._app.route(method, path, wrapped, schema)
             self.routes.append({
                 "method": method,
@@ -327,7 +338,7 @@ class App:
                 "func": handler,
                 "response_model": response_model,
             })
-            self._app.route(method, full_path, _wrap_handler(handler, response_model=response_model), schema)
+            self._app.route(method, full_path, _wrap_handler(handler, response_model=response_model, exception_handlers=self.exception_handlers), schema)
 
     def get(self, path: str, response_model: Optional[Any] = None):
         return self.route("GET", path, response_model=response_model)
@@ -345,13 +356,19 @@ class App:
         def decorator(func: Callable):
             # WebSocket routes are special, we communicate them differently in schema
             schema = _build_route_schema(func, path)
-            wrapped = _wrap_handler(func)
+            wrapped = _wrap_handler(func, exception_handlers=self.exception_handlers)
             self._app.route("WS", path, wrapped, schema)
             self.routes.append({
                 "method": "WS",
                 "path": path,
                 "func": func,
             })
+            return func
+        return decorator
+
+    def exception_handler(self, exc_class: type):
+        def decorator(func: Callable):
+            self.exception_handlers[exc_class] = func
             return func
         return decorator
 
