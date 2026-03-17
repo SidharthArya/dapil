@@ -17,6 +17,8 @@ from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
 from .openapi import get_openapi, get_swagger_ui_html
 from .depends import Depends
+from .params import Header, Cookie, Form, File, Param
+from .requests import Request, UploadFile
 
 def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
     schema = []
@@ -34,12 +36,27 @@ def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
                 if param.default.dependency:
                     _extract(param.default.dependency)
                 continue
-                
+            
+            source = None
+            if isinstance(param.default, Param):
+                if isinstance(param.default, Header):
+                    source = "header"
+                elif isinstance(param.default, Cookie):
+                    source = "cookie"
+                elif isinstance(param.default, Form):
+                    source = "form"
+                elif isinstance(param.default, File):
+                    source = "file"
+            
             if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
-                schema.append({"name": name, "source": "body", "type": "json"})
+                source = source or "body"
+                schema.append({"name": name, "source": source, "type": "json"})
+            elif param.annotation is UploadFile:
+                source = source or "file"
+                schema.append({"name": name, "source": source, "type": "file"})
             else:
                 is_path_param = f"{{{name}}}" in path
-                source = "path" if is_path_param else "query"
+                source = source or ("path" if is_path_param else "query")
                 type_str = "str"
                 if param.annotation is int:
                     type_str = "int"
@@ -99,7 +116,7 @@ async def _resolve_params(handler: Callable, request: Request, kwargs: Dict[str,
                 raise HTTPException(status_code=400, detail=f"Missing parameter '{name}'")
     return call_args
 
-def _wrap_handler(handler: Callable):
+def _wrap_handler(handler: Callable, response_model: Optional[Any] = None):
     is_async = inspect.iscoroutinefunction(handler)
     sig = inspect.signature(handler)
     
@@ -164,6 +181,26 @@ def _wrap_handler(handler: Callable):
             else:
                 res = handler(**call_args)
 
+            if response_model:
+                if isinstance(res, (dict, list)):
+                    try:
+                        # Use pydantic to validate and filter
+                        if hasattr(response_model, "model_validate"):
+                            res = response_model.model_validate(res).model_dump()
+                        else:
+                            # Handle cases like List[User] using TypeAdapter if available
+                            try:
+                                from pydantic import TypeAdapter
+                                res = TypeAdapter(response_model).validate_python(res)
+                                if hasattr(res, "model_dump"):
+                                    res = res.model_dump()
+                                elif isinstance(res, list):
+                                    res = [i.model_dump() if hasattr(i, "model_dump") else i for i in res]
+                            except (ImportError, Exception):
+                                pass
+                    except ValidationError as e:
+                        raise HTTPException(status_code=500, detail=f"Response validation error: {e.errors()}")
+
             if isinstance(res, (dict, list)):
                 return Response(json_dumps(res), status_code=200, headers={"Content-Type": "application/json"})
             return res
@@ -219,15 +256,16 @@ class App:
                     )
                 )
         
-    def route(self, method: str, path: str):
+    def route(self, method: str, path: str, response_model: Optional[Any] = None):
         def decorator(func: Callable):
             schema = _build_route_schema(func, path)
-            wrapped = _wrap_handler(func)
+            wrapped = _wrap_handler(func, response_model=response_model)
             self._app.route(method, path, wrapped, schema)
             self.routes.append({
                 "method": method,
                 "path": path,
                 "func": func,
+                "response_model": response_model,
             })
             return func
         return decorator
@@ -236,7 +274,18 @@ class App:
         self._app.add_middleware_instance(middleware_class(self, **options))
 
     def include_router(self, router: APIRouter, prefix: str = ""):
-        for method, path, handler in router.routes:
+        for route_data in router.routes:
+            if isinstance(route_data, tuple):
+                # Backwards compat for old APIRouter tuple format if any
+                method, path, handler = route_data[:3]
+                options = route_data[3] if len(route_data) > 3 else {}
+            else:
+                method = route_data["method"]
+                path = route_data["path"]
+                handler = route_data["handler"]
+                options = route_data.get("options", {})
+
+            response_model = options.get("response_model")
             full_path = prefix + path
             if not full_path.startswith("/"):
                 full_path = "/" + full_path
@@ -245,20 +294,21 @@ class App:
                 "method": method,
                 "path": full_path,
                 "func": handler,
+                "response_model": response_model,
             })
-            self._app.route(method, full_path, _wrap_handler(handler), schema)
+            self._app.route(method, full_path, _wrap_handler(handler, response_model=response_model), schema)
 
-    def get(self, path: str):
-        return self.route("GET", path)
+    def get(self, path: str, response_model: Optional[Any] = None):
+        return self.route("GET", path, response_model=response_model)
 
-    def post(self, path: str):
-        return self.route("POST", path)
+    def post(self, path: str, response_model: Optional[Any] = None):
+        return self.route("POST", path, response_model=response_model)
 
-    def put(self, path: str):
-        return self.route("PUT", path)
+    def put(self, path: str, response_model: Optional[Any] = None):
+        return self.route("PUT", path, response_model=response_model)
 
-    def delete(self, path: str):
-        return self.route("DELETE", path)
+    def delete(self, path: str, response_model: Optional[Any] = None):
+        return self.route("DELETE", path, response_model=response_model)
 
     def serve(self):
         self._app.serve()
@@ -276,3 +326,9 @@ class App:
         return self
 
 Dapil = App
+
+__all__ = [
+    "Dapil", "App", "Request", "Response", "JSONResponse", "HTMLResponse", 
+    "StreamingResponse", "HTTPException", "Depends", "BaseMiddleware",
+    "APIRouter", "Header", "Cookie", "Form", "File", "UploadFile"
+]

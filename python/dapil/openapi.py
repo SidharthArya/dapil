@@ -132,6 +132,37 @@ def get_openapi(
             operation["parameters"] = parameters
         if request_body:
             operation["requestBody"] = request_body
+            
+        # Handle response_model
+        response_model = route.get("response_model")
+        if response_model:
+            model_name = None
+            if BaseModel and inspect.isclass(response_model) and issubclass(response_model, BaseModel):
+                model_name = response_model.__name__
+                if model_name not in components_schemas:
+                    if hasattr(response_model, "model_json_schema"):
+                        components_schemas[model_name] = response_model.model_json_schema()
+                    else:
+                        components_schemas[model_name] = response_model.schema()
+                schema_ref = {"$ref": f"#/components/schemas/{model_name}"}
+            else:
+                # Handle List[User] etc.
+                try:
+                    from pydantic import TypeAdapter
+                    adapter = TypeAdapter(response_model)
+                    # This is more complex since it might return integrated definitions
+                    res_schema = adapter.json_schema()
+                    if "$defs" in res_schema:
+                        for k, v in res_schema["$defs"].items():
+                            if k not in components_schemas:
+                                components_schemas[k] = v
+                        del res_schema["$defs"]
+                    schema_ref = res_schema
+                except:
+                    schema_ref = {}
+
+            if schema_ref:
+                operation["responses"]["200"]["content"]["application/json"]["schema"] = schema_ref
 
         output["paths"][openapi_path][method] = operation
 
