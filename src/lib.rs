@@ -97,26 +97,10 @@ impl PyCallNext {
         })
     }
 }
-
 #[derive(Debug, Clone)]
 struct PyHandler(Arc<Py<PyAny>>);
 unsafe impl Send for PyHandler {}
 unsafe impl Sync for PyHandler {}
-
-enum Task {
-    Handler {
-        handler: PyHandler,
-        request: Py<PyAny>,
-        kwargs: Py<PyDict>,
-        resp_tx: oneshot::Sender<ResponseData>,
-    },
-    Middleware {
-        instance: Py<PyAny>,
-        request: Py<PyAny>,
-        call_next: Py<PyAny>,
-        resp_tx: oneshot::Sender<ResponseData>,
-    },
-}
 
 // Custom Clone removed as Arc provides it
 
@@ -152,6 +136,96 @@ fn json_to_py(py: Python, val: &serde_json::Value) -> PyObject {
             }
             dict.into()
         }
+    }
+}
+
+fn py_response_to_axum(py: Python, py_resp: Option<&Bound<'_, PyAny>>) -> axum::response::Response {
+    let py_resp = match py_resp {
+        Some(r) => r,
+        None => {
+            return axum::response::Response::builder().status(500).body("Internal Error".into()).unwrap();
+        }
+    };
+    
+    if let Ok(s) = py_resp.extract::<String>() {
+        return axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "text/plain")
+            .body(axum::body::Body::from(s))
+            .unwrap();
+    }
+    
+    if let Ok(b) = py_resp.extract::<Vec<u8>>() {
+        return axum::response::Response::builder()
+            .status(200)
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(b))
+            .unwrap();
+    }
+
+    if let Ok(content) = py_resp.getattr("content") {
+        let status = py_resp.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(200);
+        let mut builder = axum::response::Response::builder().status(status);
+        if let Ok(headers_dict) = py_resp.getattr("headers") {
+            if let Ok(dict) = headers_dict.downcast::<PyDict>() {
+                for (k, v) in dict {
+                    if let (Ok(ks), Ok(vs)) = (k.extract::<String>(), v.extract::<String>()) {
+                        builder = builder.header(ks, vs);
+                    }
+                }
+            }
+        }
+        
+        let is_streaming = !content.is_instance_of::<pyo3::types::PyString>() && 
+                           !content.is_instance_of::<pyo3::types::PyBytes>() && 
+                           content.try_iter().is_ok();
+                           
+        if is_streaming {
+            if let Ok(it) = content.try_iter() {
+                let mut full_body = Vec::new();
+                for chunk_res in it {
+                    if let Ok(chunk_obj) = chunk_res {
+                        if let Ok(b) = chunk_obj.extract::<Vec<u8>>() {
+                            full_body.extend(b);
+                        } else if let Ok(s) = chunk_obj.extract::<String>() {
+                            full_body.extend(s.into_bytes());
+                        }
+                    }
+                }
+                return builder.body(axum::body::Body::from(full_body)).unwrap();
+            }
+        } else {
+            let body = if let Ok(s) = content.extract::<String>() {
+                axum::body::Body::from(s)
+            } else if let Ok(b) = content.extract::<Vec<u8>>() {
+                axum::body::Body::from(b)
+            } else {
+                axum::body::Body::from(vec![])
+            };
+            return builder.body(body).unwrap();
+        }
+    }
+    
+    axum::response::Response::builder().status(500).body("Unsupported result".into()).unwrap()
+}
+
+fn handle_py_error(py: Python, e: pyo3::PyErr) -> axum::response::Response {
+    if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
+        let val = e.value(py);
+        let status_code = val.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(500);
+        let detail = val.getattr("detail").and_then(|d| d.extract::<String>()).unwrap_or_else(|_| "Internal Error".to_string());
+        axum::response::Response::builder()
+            .status(status_code)
+            .header("content-type", "text/plain")
+            .body(detail.into())
+            .unwrap()
+    } else {
+        e.print(py);
+        axum::response::Response::builder()
+            .status(500)
+            .header("content-type", "text/plain")
+            .body("Internal Server Error".into())
+            .unwrap()
     }
 }
 
@@ -231,8 +305,8 @@ impl App {
 
 impl App {
     fn serve_single(&mut self, py: Python<'_>) -> PyResult<()> {
-        let runtime = Runtime::new().expect("Failed to create Tokio Runtime");
-        self.setup_and_run(py, runtime)
+        self.setup_and_run(py)?;
+        Ok(())
     }
 
     fn serve_multi(&mut self, _py: Python<'_>) -> PyResult<()> {
@@ -247,498 +321,393 @@ impl App {
                     info!("Spawned worker {} (PID: {})", i, child);
                 }
                 Ok(ForkResult::Child) => {
-                    // Child process: initialize its own runtime and serve
-                    let runtime = Runtime::new().expect("Failed to create Tokio Runtime");
-                    let _ = self.serve_worker(runtime);
+                    let _ = self.serve_worker();
                     std::process::exit(0);
                 }
                 Err(_) => panic!("Fork failed"),
             }
         }
 
-        // Master process: wait for all children
         for _ in 0..self.workers {
             let _ = wait();
         }
         Ok(())
     }
 
-    fn serve_worker(&mut self, runtime: Runtime) -> PyResult<()> {
-        Python::with_gil(|py| {
-            self.setup_and_run(py, runtime)
-        })
+    fn serve_worker(&mut self) -> PyResult<()> {
+        Python::with_gil(|py| self.setup_and_run(py))?;
+        Ok(())
     }
 
-    fn setup_and_run(&mut self, py: Python<'_>, runtime: Runtime) -> PyResult<()> {
-        let mut router = Router::new();
-        // High-performance channel for the "Single Actor" GIL model
-        let (tx, rx) = flume::unbounded::<Task>();
+    pub fn setup_and_run(&mut self, py: Python) -> PyResult<()> {
+        // Copy configs to move into Tokio task
+        let routes_copy: Vec<(String, String, PyHandler, PyObject)> = self.routes.iter()
+            .map(|(p, m, h, s)| (p.clone(), m.clone(), h.clone(), s.clone_ref(py)))
+            .collect();
+            
+        let middlewares_copy: Vec<Arc<PyObject>> = self.middlewares.iter()
+            .map(|m| Arc::new(m.0.clone_ref(py)))
+            .collect();
+            
+        let host = self.host.clone();
+        let port = self.port;
 
-        // Start the dedicated Python Worker thread
-        let worker_handle = thread::spawn(move || {
-            while let Ok(task) = rx.recv() {
-                let _ = Python::with_gil(|py| -> PyResult<()> {
-                    match task {
-                        Task::Handler { handler, request, kwargs, resp_tx } => {
-                            let mut args_vec = Vec::new();
-                            args_vec.push(request);
-                            let args = pyo3::types::PyTuple::new(py, args_vec)?;
-                            let kwargs_bound = kwargs.bind(py);
+        pyo3_async_runtimes::tokio::run(py, async move {
+            let locals = Python::with_gil(|py| pyo3_async_runtimes::tokio::get_current_locals(py).unwrap());
+            let locals_arc = Arc::new(locals);
+            
+            let req_cls = Python::with_gil(|py| {
+                let dapil = py.import("dapil").expect("failed to import dapil");
+                Arc::new(dapil.getattr("Request").expect("failed to get Request class").unbind())
+            });
 
-                            let mut result_obj = match handler.0.bind(py).call(args, Some(kwargs_bound)) {
-                                Ok(res) => res,
-                                Err(e) => {
-                                    if e.is_instance_of::<pyo3::exceptions::PyException>(py) {
-                                        let val = e.value(py);
-                                        let status_code = val.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(500);
-                                        let detail = val.getattr("detail").and_then(|d| d.extract::<String>()).unwrap_or_else(|_| "Internal Error".to_string());
-                                        let _ = resp_tx.send(ResponseData {
-                                            status: status_code,
-                                            body: BodyData::Bytes(detail.into_bytes()),
-                                            headers: vec![("content-type".to_string(), "text/plain".to_string())],
-                                        });
-                                        return Ok(());
+            let mut router = Router::new();
+
+            let is_routes_empty = routes_copy.is_empty();
+            // Apply Python routes
+            for (path, method, handler, schema) in routes_copy {
+                let handler = handler.clone();
+                let path = path.clone();
+                let locals_arc = locals_arc.clone();
+                let req_cls = req_cls.clone();
+
+                let is_async = Python::with_gil(|py| {
+                    match py.import("inspect") {
+                        Ok(inspect) => match inspect.call_method1("iscoroutinefunction", (handler.0.bind(py),)) {
+                            Ok(res) => res.extract::<bool>().unwrap_or(false),
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    }
+                });
+
+                let mut params_schema: Vec<ParamDef> = Vec::new();
+                let mut needs_body = false;
+                Python::with_gil(|py| {
+                    if let Ok(schema_list) = schema.bind(py).downcast::<PyList>() {
+                        for item in schema_list {
+                            if let Ok(dict) = item.downcast::<PyDict>() {
+                                let name_res: PyResult<Option<Bound<PyAny>>> = dict.get_item("name");
+                                let source_res: PyResult<Option<Bound<PyAny>>> = dict.get_item("source");
+                                let type_res: PyResult<Option<Bound<PyAny>>> = dict.get_item("type");
+                                
+                                if let (Ok(Some(name_obj)), Ok(Some(source_obj)), Ok(Some(type_obj))) = (name_res, source_res, type_res) {
+                                    let source = source_obj.extract::<String>().unwrap_or_default();
+                                    if source == "body" {
+                                        needs_body = true;
                                     }
-                                    e.print(py);
-                                    let _ = resp_tx.send(ResponseData {
-                                        status: 500,
-                                        body: BodyData::Bytes("Internal Server Error".into()),
-                                        headers: vec![],
+                                    params_schema.push(ParamDef {
+                                        name: name_obj.extract::<String>().unwrap_or_default(),
+                                        source,
+                                        param_type: type_obj.extract::<String>().unwrap_or_default(),
                                     });
-                                    return Ok(());
                                 }
+                            }
+                        }
+                    }
+                });
+
+                let axum_path = path.replace('{', ":").replace('}', "");
+                
+                let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: Request| {
+                    let params_schema = params_schema.clone();
+                    let params = params.0;
+                    let h = handler.clone();
+                    let locals_clone = locals_arc.clone();
+                    let req_cls = req_cls.clone();
+                    async move {
+                        let locals_for_scope = Python::with_gil(|py| locals_clone.clone_ref(py));
+                        pyo3_async_runtimes::tokio::scope(locals_for_scope, async move {
+                            let (parts, body) = axum_req.into_parts();
+                            
+                            let body_bytes = if needs_body {
+                                axum::body::to_bytes(body, 10 * 1024 * 1024).await.unwrap_or_default()
+                            } else {
+                                axum::body::Bytes::new()
                             };
 
-                            // Check if result is a coroutine
-                            let is_coroutine = py.import("inspect")?.call_method1("iscoroutine", (result_obj.clone(),))?.extract::<bool>().unwrap_or(false);
+                            enum ExecResult {
+                                Done(axum::response::Response),
+                                Future(std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<PyObject>> + Send>>),
+                            }
 
-                            if is_coroutine {
-                                let asyncio = py.import("asyncio")?;
-                                match asyncio.call_method1("run", (result_obj,)) {
-                                    Ok(py_res) => {
-                                        result_obj = py_res;
+                            let result = Python::with_gil(|py| -> ExecResult {
+                                let req_cls = req_cls.bind(py);
+                                let scope = PyDict::new(py);
+                                
+                                let _ = scope.set_item("method", parts.method.as_str());
+                                let _ = scope.set_item("path", parts.uri.path());
+                                let query_string = parts.uri.query().unwrap_or("");
+                                let _ = scope.set_item("query_string", query_string.as_bytes());
+                                
+                                let headers = PyList::empty(py);
+                                for (name, value) in parts.headers.iter() {
+                                    let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
+                                }
+                                let _ = scope.set_item("headers", headers);
+                                if needs_body {
+                                    let _ = scope.set_item("_body", body_bytes.as_ref());
+                                } else {
+                                    let _ = scope.set_item("_body", b"");
+                                }
+
+                                let req_obj = req_cls.call1((scope,)).expect("failed to create Request");
+                                
+                                let kwargs = PyDict::new(py);
+                                
+                                let mut query_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                                if !query_string.is_empty() {
+                                    for (k, v) in form_urlencoded::parse(query_string.as_bytes()).into_owned() {
+                                        query_map.insert(k, v);
+                                    }
+                                }
+
+                                for pdef in &params_schema {
+                                    match pdef.source.as_str() {
+                                        "path" => {
+                                            if let Some(val) = params.get(&pdef.name) {
+                                                match pdef.param_type.as_str() {
+                                                    "int" => if let Ok(i) = val.parse::<i64>() { let _ = kwargs.set_item(&pdef.name, i); },
+                                                    "float" => if let Ok(f) = val.parse::<f64>() { let _ = kwargs.set_item(&pdef.name, f); },
+                                                    "bool" => if let Ok(b) = val.parse::<bool>() { let _ = kwargs.set_item(&pdef.name, b); },
+                                                    _ => { let _ = kwargs.set_item(&pdef.name, val); }
+                                                }
+                                            }
+                                        },
+                                        "query" => {
+                                            if let Some(val) = query_map.get(&pdef.name) {
+                                                match pdef.param_type.as_str() {
+                                                    "int" => if let Ok(i) = val.parse::<i64>() { let _ = kwargs.set_item(&pdef.name, i); },
+                                                    "float" => if let Ok(f) = val.parse::<f64>() { let _ = kwargs.set_item(&pdef.name, f); },
+                                                    "bool" => if let Ok(b) = val.parse::<bool>() { let _ = kwargs.set_item(&pdef.name, b); },
+                                                    _ => { let _ = kwargs.set_item(&pdef.name, val); }
+                                                }
+                                            }
+                                        },
+                                        "body" => {
+                                            if pdef.param_type == "json" && !body_bytes.is_empty() {
+                                                if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                                                    let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
+                                                }
+                                            }
+                                        },
+                                        _ => {}
+                                    }
+                                }
+
+                                let mut args_vec = Vec::new();
+                                args_vec.push(req_obj.into_any());
+                                let args = pyo3::types::PyTuple::new(py, args_vec).unwrap();
+
+                                match h.0.bind(py).call(args, Some(&kwargs)) {
+                                    Ok(res) => {
+                                        if is_async {
+                                             let fut = pyo3_async_runtimes::tokio::into_future(res).unwrap();
+                                             ExecResult::Future(Box::pin(fut))
+                                        } else {
+                                             ExecResult::Done(py_response_to_axum(py, Some(&res)))
+                                        }
                                     }
                                     Err(e) => {
-                                        e.print(py);
-                                        let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Async Handler Error".into()), headers: vec![] });
-                                        return Ok(());
+                                        ExecResult::Done(handle_py_error(py, e))
                                     }
                                 }
-                            }
-
-                            // Handle different return types
-                            if let Ok(s) = result_obj.extract::<String>() {
-                                let _ = resp_tx.send(ResponseData {
-                                    status: 200,
-                                    body: BodyData::Bytes(s.into_bytes()),
-                                    headers: vec![("content-type".to_string(), "text/plain".to_string())],
-                                });
-                                return Ok(());
-                            } 
-                            
-                            if let Ok(b) = result_obj.extract::<Vec<u8>>() {
-                                 let _ = resp_tx.send(ResponseData {
-                                    status: 200,
-                                    body: BodyData::Bytes(b),
-                                    headers: vec![("content-type".to_string(), "application/octet-stream".to_string())],
-                                });
-                                return Ok(());
-                            }
-
-                            // Check if it's a Response or StreamingResponse object
-                            if let Ok(content) = result_obj.getattr("content") {
-                                let status = result_obj.getattr("status_code").and_then(|s| s.extract::<u16>()).unwrap_or(200);
-                                let headers_dict = result_obj.getattr("headers").and_then(|h| h.extract::<std::collections::HashMap<String, String>>()).unwrap_or_default();
-                                let mut headers = Vec::new();
-                                for (k, v) in headers_dict {
-                                    headers.push((k, v));
-                                }
-                                // Check for StreamingResponse marker
-                                let is_streaming = !content.is_instance_of::<pyo3::types::PyString>() && 
-                                                   !content.is_instance_of::<pyo3::types::PyBytes>() && 
-                                                   content.try_iter().is_ok();
-
-                                if is_streaming {
-                                    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<u8>>(10);
-                                    
-                                    let _ = resp_tx.send(ResponseData {
-                                        status,
-                                        body: BodyData::Stream(chunk_rx),
-                                        headers: headers.clone(),
-                                    });
-
-                                    // Now iterate and send chunks
-                                    if let Ok(it) = content.try_iter() {
-                                        for chunk_res in it {
-                                            match chunk_res {
-                                                Ok(chunk_obj) => {
-                                                    let chunk = if let Ok(s) = chunk_obj.extract::<String>() {
-                                                        s.into_bytes()
-                                                    } else if let Ok(b) = chunk_obj.extract::<Vec<u8>>() {
-                                                        b
-                                                    } else {
-                                                        vec![]
-                                                    };
-                                                    if let Err(_) = chunk_tx.blocking_send(chunk) {
-                                                        break;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    e.print(py);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    // Default bytes/string body
-                                    let body = if let Ok(s) = content.extract::<String>() {
-                                        BodyData::Bytes(s.into_bytes())
-                                    } else if let Ok(b) = content.extract::<Vec<u8>>() {
-                                        BodyData::Bytes(b)
-                                    } else {
-                                        BodyData::Bytes(vec![])
-                                    };
-                                    let _ = resp_tx.send(ResponseData { status, body, headers });
-                                }
-                            } else {
-                                // Final fallback
-                                let _ = resp_tx.send(ResponseData {
-                                    status: 500,
-                                    body: BodyData::Bytes("Unsupported result type".into()),
-                                    headers: vec![],
-                                });
-                            }
-                        }
-                        Task::Middleware { instance, request, call_next, resp_tx } => {
-                             let inst = instance.bind(py);
-                             match inst.call_method1("dispatch", (request, call_next)) {
-                                Ok(coro) => {
-                                    let asyncio = py.import("asyncio")?;
-                                    match asyncio.call_method1("run", (coro,)) {
-                                        Ok(py_resp_bound) => {
-                                            let status = py_resp_bound.getattr("status_code")
-                                                .and_then(|s: Bound<'_, PyAny>| s.extract::<u16>())
-                                                .unwrap_or(200);
-                                            let content = py_resp_bound.getattr("content")
-                                                .and_then(|c: Bound<'_, PyAny>| c.extract::<Vec<u8>>())
-                                                .unwrap_or_default();
-                                            let headers_dict = py_resp_bound.getattr("headers")
-                                                .and_then(|h: Bound<'_, PyAny>| h.extract::<std::collections::HashMap<String, String>>())
-                                                .unwrap_or_default();
-                                            let mut headers = Vec::new();
-                                            for (k, v) in headers_dict {
-                                                headers.push((k, v));
-                                            }
-                                            let _ = resp_tx.send(ResponseData { status, body: BodyData::Bytes(content), headers });
-                                        }
-                                        Err(e) => {
-                                            e.print(py);
-                                            let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Middleware error".into()), headers: vec![] });
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    e.print(py);
-                                    let _ = resp_tx.send(ResponseData { status: 500, body: BodyData::Bytes("Middleware dispatch error".into()), headers: vec![] });
-                                }
-                             }
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        });
-
-        // Clone routes to avoid holding a borrow on self during router construction
-        let routes_copy: Vec<(String, String, PyHandler, PyObject)> = Python::with_gil(|py| {
-            self.routes.iter().map(|(p, m, h, s)| (p.clone(), m.clone(), h.clone(), s.clone_ref(py))).collect()
-        });
-
-        for (path, method, handler, schema) in routes_copy {
-            let mut params_schema: Vec<ParamDef> = Vec::new();
-            Python::with_gil(|py| {
-                if let Ok(schema_list) = schema.bind(py).downcast::<PyList>() {
-                    for item in schema_list {
-                        if let Ok(dict) = item.downcast::<PyDict>() {
-                            if let (Ok(Some(name_obj)), Ok(Some(source_obj)), Ok(Some(type_obj))) = (
-                                dict.get_item("name"),
-                                dict.get_item("source"),
-                                dict.get_item("type"),
-                            ) {
-                                params_schema.push(ParamDef {
-                                    name: name_obj.extract::<String>().unwrap_or_default(),
-                                    source: source_obj.extract::<String>().unwrap_or_default(),
-                                    param_type: type_obj.extract::<String>().unwrap_or_default(),
-                                });
-                            }
-                        }
-                    }
-                }
-            });
-
-            let tx_clone = tx.clone();
-            let axum_path = path.replace('{', ":").replace('}', "");
-            
-            let run_handler = move |params: Path<std::collections::HashMap<String, String>>, axum_req: Request| {
-                let params_schema = params_schema.clone();
-                let params = params.0;
-                let h = handler.clone();
-                let tx_inner = tx_clone.clone();
-                async move {
-                    let (resp_tx, resp_rx) = oneshot::channel();
-                    
-                    let (parts, body) = axum_req.into_parts();
-                    let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024).await.unwrap_or_default();
-
-                    let py_req = Python::with_gil(|py| {
-                        let dapil = py.import("dapil").expect("failed to import dapil");
-                        let req_cls = dapil.getattr("Request").expect("failed to get Request class");
-                        let scope = PyDict::new(py);
-                        
-                        let _ = scope.set_item("method", parts.method.as_str());
-                        let _ = scope.set_item("path", parts.uri.path());
-                        let query_string = parts.uri.query().unwrap_or("");
-                        let _ = scope.set_item("query_string", query_string.as_bytes());
-                        
-                        let headers = PyList::empty(py);
-                        for (name, value) in parts.headers.iter() {
-                            let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
-                        }
-                        let _ = scope.set_item("headers", headers);
-                        let _ = scope.set_item("_body", body_bytes.as_ref());
-
-                        let req_obj = req_cls.call1((scope,)).expect("failed to create Request").unbind();
-                        
-                        let kwargs = PyDict::new(py);
-                        
-                        let mut query_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-                        if !query_string.is_empty() {
-                            for (k, v) in form_urlencoded::parse(query_string.as_bytes()).into_owned() {
-                                query_map.insert(k, v);
-                            }
-                        }
-
-                        for pdef in &params_schema {
-                            match pdef.source.as_str() {
-                                "path" => {
-                                    if let Some(val) = params.get(&pdef.name) {
-                                        match pdef.param_type.as_str() {
-                                            "int" => if let Ok(i) = val.parse::<i64>() { let _ = kwargs.set_item(&pdef.name, i); },
-                                            "float" => if let Ok(f) = val.parse::<f64>() { let _ = kwargs.set_item(&pdef.name, f); },
-                                            "bool" => if let Ok(b) = val.parse::<bool>() { let _ = kwargs.set_item(&pdef.name, b); },
-                                            _ => { let _ = kwargs.set_item(&pdef.name, val); }
-                                        }
-                                    }
-                                },
-                                "query" => {
-                                    if let Some(val) = query_map.get(&pdef.name) {
-                                        match pdef.param_type.as_str() {
-                                            "int" => if let Ok(i) = val.parse::<i64>() { let _ = kwargs.set_item(&pdef.name, i); },
-                                            "float" => if let Ok(f) = val.parse::<f64>() { let _ = kwargs.set_item(&pdef.name, f); },
-                                            "bool" => if let Ok(b) = val.parse::<bool>() { let _ = kwargs.set_item(&pdef.name, b); },
-                                            _ => { let _ = kwargs.set_item(&pdef.name, val); }
-                                        }
-                                    }
-                                },
-                                "body" => {
-                                    if pdef.param_type == "json" && !body_bytes.is_empty() {
-                                        if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                                            let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
-                                        }
-                                    }
-                                },
-                                _ => {}
-                            }
-                        }
-                        (req_obj, kwargs.into())
-                    });
-
-                    let _ = tx_inner.send(Task::Handler {
-                        handler: h,
-                        request: py_req.0,
-                        kwargs: py_req.1,
-                        resp_tx,
-                    });
-                    resp_rx.await.unwrap_or(ResponseData {
-                        status: 500,
-                        body: BodyData::Bytes("Worker channel lost".into()),
-                        headers: vec![],
-                    })
-                }
-            };
-
-            router = match method.as_str() {
-                "GET" => router.route(&axum_path, routing::get(run_handler)),
-                "POST" => router.route(&axum_path, routing::post(run_handler)),
-                "PUT" => router.route(&axum_path, routing::put(run_handler)),
-                "DELETE" => router.route(&axum_path, routing::delete(run_handler)),
-                _ => router.route(&axum_path, routing::get(run_handler)),
-            };
-        }
-
-        // Apply Python middlewares as layers
-        for mw in &self.middlewares {
-            let tx_mw = tx.clone();
-            let mw_inst = mw.clone();
-            router = router.layer(axum::middleware::from_fn(move |req: Request, next: axum::middleware::Next| {
-                let tx = tx_mw.clone();
-                let mw = mw_inst.clone();
-                async move {
-                    let (call_tx, mut call_rx) = mpsc::channel::<(Py<PyAny>, oneshot::Sender<ResponseData>)>(1);
-                    let (resp_tx, mut resp_rx) = oneshot::channel::<ResponseData>();
-                    
-                    let (parts, body) = req.into_parts();
-                    let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024).await.unwrap_or_default();
-                    let body_clone = body_bytes.clone();
-                    let parts_clone = parts.clone();
-
-                    // Bridge to Python
-                    Python::with_gil(|py| {
-                        let call_next = PyCallNext { tx: call_tx };
-                        // Convert Axum Request to Python-friendly Request (simplified for now)
-                        let dapil = py.import("dapil").expect("failed to import dapil");
-                        let req_cls = dapil.getattr("Request").expect("failed to get Request class");
-                        let scope = PyDict::new(py);
-                        
-                        let _ = scope.set_item("method", parts_clone.method.as_str());
-                        let _ = scope.set_item("path", parts_clone.uri.path());
-                        let _ = scope.set_item("query_string", parts_clone.uri.query().unwrap_or("").as_bytes());
-
-                        let headers = PyList::empty(py);
-                        for (name, value) in parts_clone.headers.iter() {
-                            let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
-                        }
-                        let _ = scope.set_item("headers", headers);
-                        let _ = scope.set_item("_body", body_bytes.as_ref());
-
-                        let py_req = req_cls.call1((scope,)).expect("failed to create Request");
-                        
-                        let call_next_obj = Bound::new(py, call_next).expect("failed to create PyCallNext").into_any().unbind();
-                        
-                        let _ = tx.send(Task::Middleware {
-                            instance: mw.0.clone_ref(py),
-                            request: py_req.into(),
-                            call_next: call_next_obj,
-                            resp_tx,
-                        });
-                    });
-
-                    // Wait for middleware response OR call_next
-                    tokio::select! {
-                        res = &mut resp_rx => {
-                            res.unwrap_or(ResponseData { status: 500, body: BodyData::Bytes("Mid error".into()), headers: vec![] }).into_response()
-                        }
-                        Some((_py_req, next_resp_tx)) = call_rx.recv() => {
-                            let axum_resp = next.run(Request::from_parts(parts, Body::from(body_clone))).await;
-                            // Convert Axum response back to ResponseData for Python
-                            // (Simplified: just extraction status and body for now)
-                            let status = axum_resp.status().as_u16();
-                            let body_bytes = match axum::body::to_bytes(axum_resp.into_body(), 10 * 1024 * 1024).await {
-                                Ok(b) => b.to_vec(),
-                                Err(_) => vec![],
-                            };
-                            let _ = next_resp_tx.send(ResponseData {
-                                status,
-                                body: BodyData::Bytes(body_bytes),
-                                headers: vec![],
                             });
-                            // Now wait for the middleware to finally return the response after call_next
-                            resp_rx.await.unwrap_or(ResponseData { status: 500, body: BodyData::Bytes("Mid post-call error".into()), headers: vec![] }).into_response()
+
+                            match result {
+                                ExecResult::Done(resp) => resp,
+                                ExecResult::Future(fut) => {
+                                    match fut.await {
+                                        Ok(py_obj) => Python::with_gil(|py| py_response_to_axum(py, Some(py_obj.bind(py)))),
+                                        Err(e) => Python::with_gil(|py| handle_py_error(py, e)),
+                                    }
+                                }
+                            }
+                        }).await
+                    }
+                };
+
+                router = match method.as_str() {
+                    "GET" => router.route(&axum_path, routing::get(run_handler)),
+                    "POST" => router.route(&axum_path, routing::post(run_handler)),
+                    "PUT" => router.route(&axum_path, routing::put(run_handler)),
+                    "DELETE" => router.route(&axum_path, routing::delete(run_handler)),
+                    _ => router.route(&axum_path, routing::get(run_handler)),
+                };
+            }
+
+            for mw_arc in &middlewares_copy {
+                let mw_arc = mw_arc.clone();
+                let locals_clone = locals_arc.clone();
+                let req_cls = req_cls.clone();
+                
+                let is_mw_async = Python::with_gil(|py| {
+                    match mw_arc.bind(py).getattr("dispatch") {
+                        Ok(dispatch_method) => match py.import("inspect") {
+                            Ok(inspect) => match inspect.call_method1("iscoroutinefunction", (dispatch_method,)) {
+                                Ok(res) => res.extract::<bool>().unwrap_or(false),
+                                Err(_) => false,
+                            },
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    }
+                });
+
+                router = router.layer(axum::middleware::from_fn(move |req: Request, next: axum::middleware::Next| {
+                    let mw_arc = mw_arc.clone();
+                    let locals_clone = locals_clone.clone();
+                    let req_cls = req_cls.clone();
+                    async move {
+                        let locals_for_scope = Python::with_gil(|py| locals_clone.clone_ref(py));
+                        pyo3_async_runtimes::tokio::scope(locals_for_scope, async move {
+                            let (call_tx, mut _call_rx) = mpsc::channel(1);
+                            
+                            let (parts, body) = req.into_parts();
+                            let body_bytes = axum::body::to_bytes(body, 10 * 1024 * 1024).await.unwrap_or_default();
+                            let body_clone = body_bytes.clone();
+                            let parts_clone = parts.clone();
+
+                            enum MiddlewareExecResult {
+                                Done(axum::response::Response),
+                                CallNext(Request),
+                                Future(std::pin::Pin<Box<dyn std::future::Future<Output = PyResult<PyObject>> + Send>>),
+                            }
+
+                            let result = Python::with_gil(|py| -> MiddlewareExecResult {
+                                let mw_obj = mw_arc.clone_ref(py);
+                                let req_cls = req_cls.bind(py);
+                                let scope = PyDict::new(py);
+                                
+                                let _ = scope.set_item("method", parts_clone.method.as_str());
+                                let _ = scope.set_item("path", parts_clone.uri.path());
+                                let _ = scope.set_item("query_string", parts_clone.uri.query().unwrap_or("").as_bytes());
+
+                                let headers = PyList::empty(py);
+                                for (name, value) in parts_clone.headers.iter() {
+                                    let _ = headers.append((name.as_str().as_bytes(), value.as_bytes()));
+                                }
+                                let _ = scope.set_item("headers", headers);
+                                let _ = scope.set_item("_body", body_bytes.as_ref());
+
+                                let py_req = req_cls.call1((scope,)).expect("failed to create Request");
+
+                                let call_next_py = Bound::new(py, PyCallNext { tx: call_tx }).unwrap().into_any().unbind();
+
+                                match mw_obj.bind(py).call_method1("dispatch", (py_req, call_next_py)) {
+                                    Ok(res) => {
+                                        if is_mw_async {
+                                            let fut = pyo3_async_runtimes::tokio::into_future(res).unwrap();
+                                            MiddlewareExecResult::Future(Box::pin(fut))
+                                        } else {
+                                            MiddlewareExecResult::Done(py_response_to_axum(py, Some(&res)))
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if e.is_instance_of::<pyo3::exceptions::PyStopIteration>(py) {
+                                            MiddlewareExecResult::CallNext(Request::from_parts(parts_clone, Body::from(body_clone)))
+                                        } else {
+                                            MiddlewareExecResult::Done(handle_py_error(py, e))
+                                        }
+                                    }
+                                }
+                            });
+
+                            match result {
+                                MiddlewareExecResult::Done(resp) => resp,
+                                MiddlewareExecResult::CallNext(original_req) => {
+                                    next.run(original_req).await
+                                }
+                                MiddlewareExecResult::Future(fut) => {
+                                    match fut.await {
+                                        Ok(py_obj) => Python::with_gil(|py| py_response_to_axum(py, Some(py_obj.bind(py)))),
+                                        Err(e) => Python::with_gil(|py| handle_py_error(py, e)),
+                                    }
+                                }
+                            }
+                        }).await
+                    }
+                }));
+            }
+
+            if is_routes_empty {
+                 router = router.route("/", routing::get(|| async { "Dapil is running!" }));
+            }
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+            let addr = format!("{}:{}", host, port);
+            
+            let socket = socket2::Socket::new(
+                if addr.contains(':') && addr.split(':').next().unwrap().contains('.') { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 },
+                socket2::Type::STREAM,
+                None,
+            ).expect("Failed to create socket");
+
+            socket.set_reuse_address(true).expect("Failed to set reuse address");
+            #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+            socket.set_reuse_port(true).expect("Failed to set reuse port");
+            socket.set_nonblocking(true).expect("Failed to set nonblocking");
+
+            let address: std::net::SocketAddr = addr.parse().expect("Failed to parse address");
+            socket.bind(&address.into()).expect("Failed to bind socket");
+            socket.listen(1024).expect("Failed to listen");
+
+            let listener = TcpListener::from_std(socket.into()).expect("Failed to convert socket");
+
+            info!("Dapil serving on http://{}", addr);
+
+            {
+                let server_task = async move {
+                    axum::serve(listener, router)
+                        .with_graceful_shutdown(async move {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                };
+
+                tokio::pin!(server_task);
+
+                loop {
+                    tokio::select! {
+                        res = &mut server_task => {
+                            if let Err(e) = res {
+                                println!("Axum server error: {}", e);
+                            }
+                            break;
+                        }
+                        _ = tokio::signal::ctrl_c() => {
+                            println!("Shutdown signal received, starting graceful shutdown...");
+                            let _ = shutdown_tx.send(());
+                            
+                            tokio::select! {
+                                res = &mut server_task => {
+                                    if let Err(e) = res {
+                                        println!("Axum server error during shutdown: {}", e);
+                                    }
+                                    println!("Server stopped gracefully");
+                                }
+                                _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                                    println!("Shutdown timeout exceeded, force stopping network...");
+                                }
+                                _ = tokio::signal::ctrl_c() => {
+                                    println!("Second Ctrl+C detected, force stopping process...");
+                                    std::process::exit(130);
+                                }
+                            }
+                            break;
                         }
                     }
                 }
-            }));
-        }
+            } 
 
-        if self.routes.is_empty() {
-             router = router.route("/", routing::get(|| async { "Dapil is running!" }));
-        }
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-        py.allow_threads(|| {
-            runtime.block_on(async {
-                let addr = format!("{}:{}", self.host, self.port);
-                
-                // Use socket2 for SO_REUSEPORT
-                let socket = socket2::Socket::new(
-                    if addr.contains(':') && addr.split(':').next().unwrap().contains('.') { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 },
-                    socket2::Type::STREAM,
-                    None,
-                ).expect("Failed to create socket");
-
-                socket.set_reuse_address(true).expect("Failed to set reuse address");
-                #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
-                socket.set_reuse_port(true).expect("Failed to set reuse port");
-                socket.set_nonblocking(true).expect("Failed to set nonblocking");
-
-                let address: std::net::SocketAddr = addr.parse().expect("Failed to parse address");
-                socket.bind(&address.into()).expect("Failed to bind socket");
-                socket.listen(1024).expect("Failed to listen");
-
-                let listener = TcpListener::from_std(socket.into()).expect("Failed to convert socket");
-
-                info!("Dapil serving on http://{}", addr);
-
-                // We must ensure the router (and its clones of tx) are dropped before we join the worker thread
-                {
-                    let server_task = async move {
-                        axum::serve(listener, router)
-                            .with_graceful_shutdown(async move {
-                                let _ = shutdown_rx.await;
-                            })
-                            .await
-                    };
-
-                    tokio::pin!(server_task);
-
-                    loop {
-                        tokio::select! {
-                            res = &mut server_task => {
-                                if let Err(e) = res {
-                                    println!("Axum server error: {}", e);
-                                }
-                                break;
-                            }
-                            _ = tokio::signal::ctrl_c() => {
-                                println!("Shutdown signal received, starting graceful shutdown...");
-                                let _ = shutdown_tx.send(());
-                                
-                                // Wait for server to stop with timeout or second Ctrl+C
-                                tokio::select! {
-                                    res = &mut server_task => {
-                                        if let Err(e) = res {
-                                            println!("Axum server error during shutdown: {}", e);
-                                        }
-                                        println!("Server stopped gracefully");
-                                    }
-                                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
-                                        println!("Shutdown timeout exceeded, force stopping network...");
-                                    }
-                                    _ = tokio::signal::ctrl_c() => {
-                                        println!("Second Ctrl+C detected, force stopping process...");
-                                        std::process::exit(130);
-                                    }
-                                }
-                                break;
-                            }
-                        }
-                    }
-                } // server_task goes out of scope here, dropping everything
-
-                println!("Axum server fully dropped");
-                drop(tx);
-                
-                println!("Joining Python worker thread...");
-            });
-            let _ = worker_handle.join();
-            println!("Python worker thread joined");
-        });
-
-        // After releasing the GIL, check if a signal (like Ctrl+C) occurred
-        py.check_signals()?;
-
+            println!("Axum server fully dropped");
+            
+            Ok::<(), PyErr>(())
+        }).unwrap();
+        
+        py.check_signals().unwrap();
+        println!("Server stopped gracefully");
         Ok(())
     }
 }
