@@ -66,10 +66,21 @@ def _get_route_parameters(func: Callable, path: str, components_schemas: Dict[st
             elif param.annotation is float:
                 schema["type"] = "number"
 
+            from .params import Param
+            if isinstance(param.default, Param):
+                if param.default.gt is not None: schema["exclusiveMinimum"] = param.default.gt
+                if param.default.ge is not None: schema["minimum"] = param.default.ge
+                if param.default.lt is not None: schema["exclusiveMaximum"] = param.default.lt
+                if param.default.le is not None: schema["maximum"] = param.default.le
+                if param.default.multiple_of is not None: schema["multipleOf"] = param.default.multiple_of
+                if param.default.min_length is not None: schema["minLength"] = param.default.min_length
+                if param.default.max_length is not None: schema["maxLength"] = param.default.max_length
+                if param.default.pattern is not None: schema["pattern"] = param.default.pattern
+
             param_dict = {
                 "name": name,
                 "in": param_in,
-                "required": param.default == inspect.Parameter.empty,
+                "required": param.default == inspect.Parameter.empty or (isinstance(param.default, Param) and param.default.default == ...),
                 "schema": schema,
             }
             # Only add to parameters if not already in there to avoid duplicates from multi-depends

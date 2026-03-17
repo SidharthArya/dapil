@@ -17,7 +17,7 @@ from .middleware import BaseHTTPMiddleware as BaseMiddleware
 from .routing import APIRouter
 from .openapi import get_openapi, get_swagger_ui_html
 from .depends import Depends
-from .params import Header, Cookie, Form, File, Param
+from .params import Header, Cookie, Form, File, Param, Path, Query, Body
 from .requests import Request, UploadFile
 
 def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
@@ -47,13 +47,28 @@ def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
                     source = "form"
                 elif isinstance(param.default, File):
                     source = "file"
+                elif isinstance(param.default, Path):
+                    source = "path"
+                elif isinstance(param.default, Query):
+                    source = "query"
+                elif isinstance(param.default, Body):
+                    source = "body"
             
+            p_schema = {"name": name}
+            if isinstance(param.default, Param):
+                for attr in ["gt", "ge", "lt", "le", "multiple_of", "min_length", "max_length", "pattern"]:
+                    val = getattr(param.default, attr, None)
+                    if val is not None:
+                        p_schema[attr] = val
+
             if BaseModel and inspect.isclass(param.annotation) and issubclass(param.annotation, BaseModel):
                 source = source or "body"
-                schema.append({"name": name, "source": source, "type": "json"})
+                p_schema.update({"source": source, "type": "json"})
+                schema.append(p_schema)
             elif param.annotation is UploadFile:
                 source = source or "file"
-                schema.append({"name": name, "source": source, "type": "file"})
+                p_schema.update({"source": source, "type": "file"})
+                schema.append(p_schema)
             else:
                 is_path_param = f"{{{name}}}" in path
                 source = source or ("path" if is_path_param else "query")
@@ -65,7 +80,8 @@ def _build_route_schema(handler: Callable, path: str) -> List[Dict[str, str]]:
                 elif param.annotation is bool:
                     type_str = "bool"
                 if not any(s["name"] == name for s in schema):
-                    schema.append({"name": name, "source": source, "type": type_str})
+                    p_schema.update({"source": source, "type": type_str})
+                    schema.append(p_schema)
                 
     _extract(handler)
     return schema
@@ -330,5 +346,6 @@ Dapil = App
 __all__ = [
     "Dapil", "App", "Request", "Response", "JSONResponse", "HTMLResponse", 
     "StreamingResponse", "HTTPException", "Depends", "BaseMiddleware",
-    "APIRouter", "Header", "Cookie", "Form", "File", "UploadFile"
+    "APIRouter", "Header", "Cookie", "Form", "File", "UploadFile",
+    "Path", "Query", "Body"
 ]

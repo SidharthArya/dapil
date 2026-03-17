@@ -111,6 +111,13 @@ struct ParamDef {
     name: String,
     source: String,
     param_type: String,
+    gt: Option<f64>,
+    ge: Option<f64>,
+    lt: Option<f64>,
+    le: Option<f64>,
+    min_length: Option<usize>,
+    max_length: Option<usize>,
+    pattern: Option<String>,
 }
 
 fn json_to_py(py: Python, val: &serde_json::Value) -> PyObject {
@@ -452,6 +459,13 @@ impl App {
                                         name: name_obj.extract::<String>().unwrap_or_default(),
                                         source,
                                         param_type: type_obj.extract::<String>().unwrap_or_default(),
+                                        gt: dict.get_item("gt").unwrap_or(None).and_then(|v| v.extract::<f64>().ok()),
+                                        ge: dict.get_item("ge").unwrap_or(None).and_then(|v| v.extract::<f64>().ok()),
+                                        lt: dict.get_item("lt").unwrap_or(None).and_then(|v| v.extract::<f64>().ok()),
+                                        le: dict.get_item("le").unwrap_or(None).and_then(|v| v.extract::<f64>().ok()),
+                                        min_length: dict.get_item("min_length").unwrap_or(None).and_then(|v| v.extract::<usize>().ok()),
+                                        max_length: dict.get_item("max_length").unwrap_or(None).and_then(|v| v.extract::<usize>().ok()),
+                                        pattern: dict.get_item("pattern").unwrap_or(None).and_then(|v| v.extract::<String>().ok()),
                                     });
                                 }
                             }
@@ -550,10 +564,20 @@ impl App {
                                                 }
                                             }
                                         },
-                                        "body" => {
-                                            if pdef.param_type == "json" && !body_bytes.is_empty() {
+                                         "body" => {
+                                            if !body_bytes.is_empty() {
                                                 if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                                                    let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
+                                                    if pdef.param_type == "json" {
+                                                        let _ = kwargs.set_item(&pdef.name, json_to_py(py, &json_val));
+                                                    } else if let Some(field_val) = json_val.get(&pdef.name) {
+                                                        match pdef.param_type.as_str() {
+                                                            "int" => if let Some(i) = field_val.as_i64() { let _ = kwargs.set_item(&pdef.name, i); },
+                                                            "float" => if let Some(f) = field_val.as_f64() { let _ = kwargs.set_item(&pdef.name, f); },
+                                                            "bool" => if let Some(b) = field_val.as_bool() { let _ = kwargs.set_item(&pdef.name, b); },
+                                                            "str" => if let Some(s) = field_val.as_str() { let _ = kwargs.set_item(&pdef.name, s); },
+                                                            _ => { let _ = kwargs.set_item(&pdef.name, json_to_py(py, field_val)); }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         },
@@ -616,6 +640,32 @@ impl App {
                                             }
                                         },
                                         _ => {}
+                                    }
+                                }
+
+                                // Validation logic
+                                for pdef in &params_schema {
+                                    if let Some(val_obj) = kwargs.get_item(&pdef.name).ok().flatten() {
+                                        if let Ok(i) = val_obj.extract::<i64>() {
+                                            let f = i as f64;
+                                            if let Some(v) = pdef.gt { if f <= v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be greater than {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.ge { if f < v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be greater than or equal to {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.lt { if f >= v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be less than {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.le { if f > v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be less than or equal to {}", pdef.name, v).into()).unwrap()); } }
+                                        } else if let Ok(f) = val_obj.extract::<f64>() {
+                                            if let Some(v) = pdef.gt { if f <= v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be greater than {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.ge { if f < v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be greater than or equal to {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.lt { if f >= v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be less than {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.le { if f > v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} must be less than or equal to {}", pdef.name, v).into()).unwrap()); } }
+                                        } else if let Ok(s) = val_obj.extract::<String>() {
+                                            if let Some(v) = pdef.min_length { if s.len() < v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} length must be at least {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(v) = pdef.max_length { if s.len() > v { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} length must be at most {}", pdef.name, v).into()).unwrap()); } }
+                                            if let Some(p) = &pdef.pattern {
+                                                if let Ok(re) = regex::Regex::new(p) {
+                                                    if !re.is_match(&s) { return ExecResult::Done(axum::response::Response::builder().status(422).body(format!("{} does not match pattern {}", pdef.name, p).into()).unwrap()); }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
 
