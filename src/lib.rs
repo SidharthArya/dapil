@@ -211,8 +211,8 @@ fn py_response_to_axum(py: Python, py_resp: Option<&Bound<'_, PyAny>>) -> axum::
     axum::response::Response::builder().status(500).body("Unsupported result".into()).unwrap()
 }
 
-#[pyclass(name = "Request")]
-pub struct DapilRequest {
+#[pyclass(module = "dapil._dapil")]
+pub struct Request {
     #[pyo3(get)]
     pub method: String,
     #[pyo3(get)]
@@ -224,7 +224,7 @@ pub struct DapilRequest {
 }
 
 #[pymethods]
-impl DapilRequest {
+impl Request {
     #[getter]
     fn headers<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyDict>> {
         let dict = PyDict::new(py);
@@ -484,7 +484,7 @@ impl App {
 
                             let result = Python::with_gil(|py| -> ExecResult {
                                 let query_string = parts.uri.query().unwrap_or("").to_string();
-                                let req_obj = crate::DapilRequest {
+                                let req_obj = crate::Request {
                                     method: parts.method.to_string(),
                                     path: parts.uri.path().to_string(),
                                     query_string: query_string.clone(),
@@ -614,7 +614,7 @@ impl App {
 
                             let result = Python::with_gil(|py| -> MiddlewareExecResult {
                                 let query_string = parts_clone.uri.query().unwrap_or("").to_string();
-                                let req_obj = crate::DapilRequest {
+                                let req_obj = crate::Request {
                                     method: parts_clone.method.to_string(),
                                     path: parts_clone.uri.path().to_string(),
                                     query_string: query_string.clone(),
@@ -753,7 +753,7 @@ fn setup_logging() {
 #[pymodule]
 fn _dapil(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<App>()?;
-    m.add_class::<DapilRequest>()?;
+    m.add_class::<Request>()?;
     m.add_function(wrap_pyfunction!(setup_logging, m)?)?;
     Ok(())
 }
